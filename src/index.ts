@@ -2,6 +2,8 @@ import { DbStore } from "./db.ts"
 import { startServer } from "./api.ts"
 import { Worker } from "./worker.ts"
 import { RepoWorkspace } from "./repo.ts"
+import { mkdirSync } from "node:fs"
+import path from "node:path"
 
 // Env configuration
 const DB_PATH = process.env.CLOCKWORK_DB_PATH ?? ":memory:"
@@ -10,6 +12,13 @@ const TRANSCRIPTS_DIR = process.env.CLOCKWORK_TRANSCRIPTS ?? "./transcripts"
 const PORT = process.env.CLOCKWORK_PORT ? Number(process.env.CLOCKWORK_PORT) : 3000
 const WORKER_PROJECT_ID = process.env.CLOCKWORK_WORKER_PROJECT_ID
 const TOKEN = process.env.CLOCKWORK_TOKEN
+
+// Ensure data directories exist (a bind/volume mount may shadow image mkdirs).
+if (DB_PATH !== ":memory:") {
+	mkdirSync(path.dirname(DB_PATH), { recursive: true })
+}
+mkdirSync(PROJECT_ROOT, { recursive: true })
+mkdirSync(TRANSCRIPTS_DIR, { recursive: true })
 
 console.log("clockwork starting...")
 console.log(`  DB: ${DB_PATH}`)

@@ -1,0 +1,38 @@
+{
+	"providers": {
+		"frame-dense-low": {
+			"baseUrl": "http://frame.lungfish-duckbill.ts.net:8185/v1",
+			"api": "openai-completions",
+			"apiKey": "frame",
+			"compat": { "supportsDeveloperRole": false, "thinkingFormat": "qwen-chat-template" },
+			"models": [
+				{
+					"id": "Qwen3.8-27B-Uncensored-Q4_K_M.gguf",
+					"name": "Frame Dense 27B [LOW/preemptible]",
+					"reasoning": true,
+					"input": ["text", "image"],
+					"contextWindow": 262144,
+					"maxTokens": 32768,
+					"cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+				}
+			]
+		},
+		"frame-agentic-low": {
+			"baseUrl": "http://frame.lungfish-duckbill.ts.net:8181/v1",
+			"api": "openai-completions",
+			"apiKey": "frame",
+			"compat": { "supportsDeveloperRole": false, "thinkingFormat": "qwen-chat-template" },
+			"models": [
+				{
+					"id": "qwen3.6-35b-a3b-heretic-sharp-mtp-Q5_K_M.gguf",
+					"name": "Frame Agentic 35B-A3B MoE [LOW/preemptible]",
+					"reasoning": true,
+					"input": ["text", "image"],
+					"contextWindow": 262144,
+					"maxTokens": 32768,
+					"cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+				}
+			]
+		}
+	}
+}
