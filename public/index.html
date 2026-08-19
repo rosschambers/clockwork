@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Clockwork Board</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #1a1a2e; color: #e0e0e0; }
+header { padding: 16px 24px; background: #16213e; display: flex; align-items: center; gap: 16px; border-bottom: 1px solid #0f3460; }
+header h1 { font-size: 18px; color: #e94560; }
+header select { padding: 6px 12px; background: #0f3460; color: #e0e0e0; border: 1px solid #533483; border-radius: 4px; font-size: 14px; }
+#status { margin-left: auto; font-size: 12px; padding: 4px 10px; border-radius: 10px; }
+#status.connected { background: #1b5e20; color: #a5d6a7; }
+#status.disconnected { background: #b71c1c; color: #ef9a9a; }
+#board { display: flex; gap: 16px; padding: 24px; overflow-x: auto; min-height: calc(100vh - 60px); }
+.column { min-width: 280px; max-width: 320px; background: #16213e; border-radius: 8px; padding: 12px; flex-shrink: 0; }
+.column h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 1px; color: #e94560; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 2px solid #0f3460; }
+.card { background: #0f3460; border-radius: 6px; padding: 12px; margin-bottom: 8px; cursor: pointer; transition: background 0.15s; border-left: 3px solid #533483; }
+.card:hover { background: #1a4a7a; }
+.card .title { font-weight: 600; font-size: 14px; margin-bottom: 4px; }
+.card .meta { font-size: 11px; color: #888; }
+.card .retry { color: #e94560; }
+.modal-overlay { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100; justify-content: center; align-items: center; }
+.modal-overlay.open { display: flex; }
+.modal { background: #16213e; border-radius: 12px; padding: 24px; width: 560px; max-width: 90vw; max-height: 85vh; overflow-y: auto; }
+.modal h2 { color: #e94560; margin-bottom: 12px; }
+.modal .body { background: #0f3460; padding: 12px; border-radius: 6px; margin: 12px 0; white-space: pre-wrap; font-size: 13px; line-height: 1.5; max-height: 200px; overflow-y: auto; }
+.modal .section { margin-top: 16px; }
+.modal .section h3 { font-size: 13px; text-transform: uppercase; color: #888; margin-bottom: 8px; }
+.modal .thread-entry { background: #0f3460; padding: 8px 12px; border-radius: 4px; margin-bottom: 4px; font-size: 12px; border-left: 2px solid #533483; }
+.modal .attempt { background: #0f3460; padding: 8px 12px; border-radius: 4px; margin-bottom: 4px; font-size: 12px; }
+.modal .attempt .verdict { font-weight: 600; }
+.modal .attempt .verdict.pass { color: #4caf50; }
+.modal .attempt .verdict.fail { color: #ff9800; }
+.modal .attempt .verdict.blocked { color: #e94560; }
+.move-section { display: flex; gap: 8px; margin-top: 16px; align-items: flex-end; }
+.move-section select, .move-section input { padding: 8px 12px; background: #0f3460; color: #e0e0e0; border: 1px solid #533483; border-radius: 4px; font-size: 13px; }
+.move-section input { flex: 1; }
+.move-section button { padding: 8px 16px; background: #e94560; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 13px; }
+.move-section button:hover { background: #c73652; }
+.modal .close-btn { float: right; background: none; border: none; color: #888; font-size: 20px; cursor: pointer; }
+.modal .close-btn:hover { color: #e94560; }
+.empty { color: #555; font-style: italic; font-size: 13px; text-align: center; padding: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Clockwork</h1>
+  <select id="project-select"><option value="">— select project —</option></select>
+  <span id="status" class="disconnected">disconnected</span>
+</header>
+<div id="board"></div>
+<div class="modal-overlay" id="modal-overlay">
+  <div class="modal">
+    <button class="close-btn" id="modal-close">&times;</button>
+    <h2 id="modal-title"></h2>
+    <div class="meta" id="modal-meta" style="font-size:12px;color:#888;margin-bottom:8px;"></div>
+    <div class="body" id="modal-body"></div>
+    <div class="section" id="modal-threads">
+      <h3>Activity</h3>
+      <div id="modal-threads-list"></div>
+    </div>
+    <div class="section" id="modal-attempts">
+      <h3>Attempts</h3>
+      <div id="modal-attempts-list"></div>
+    </div>
+    <div class="move-section">
+      <select id="move-column"></select>
+      <input id="move-reason" placeholder="Reason (optional)" />
+      <button id="move-btn">Move</button>
+    </div>
+  </div>
+</div>
+<script>
+(function() {
+  const board = document.getElementById("board");
+  const projectSelect = document.getElementById("project-select");
+  const statusEl = document.getElementById("status");
+  const overlay = document.getElementById("modal-overlay");
+  const modalTitle = document.getElementById("modal-title");
+  const modalMeta = document.getElementById("modal-meta");
+  const modalBody = document.getElementById("modal-body");
+  const threadsList = document.getElementById("modal-threads-list");
+  const attemptsList = document.getElementById("modal-attempts-list");
+  const moveColumn = document.getElementById("move-column");
+  const moveReason = document.getElementById("move-reason");
+  const moveBtn = document.getElementById("move-btn");
+  const modalClose = document.getElementById("modal-close");
+
+  let currentProject = null;
+  let columns = [];
+  let cardsByColumn = {};
+  let ws = null;
+
+  function loadProjects() {
+    fetch("/api/projects").then(r => r.json()).then(projects => {
+      projectSelect.innerHTML = '<option value="">— select project —</option>';
+      for (const p of projects) {
+        const opt = document.createElement("option");
+        opt.value = p.id;
+        opt.textContent = p.name;
+        projectSelect.appendChild(opt);
+      }
+      if (currentProject) {
+        projectSelect.value = currentProject;
+        loadBoard(currentProject);
+      }
+    });
+  }
+
+  function loadBoard(projectId) {
+    currentProject = projectId;
+    Promise.all([
+      fetch("/api/projects/" + projectId + "/columns").then(r => r.json()),
+      fetch("/api/projects/" + projectId + "/cards").then(r => r.json()),
+    ]).then(([cols, cards]) => {
+      columns = cols.sort((a, b) => a.position - b.position);
+      cardsByColumn = {};
+      for (const col of columns) {
+        cardsByColumn[col.id] = [];
+      }
+      for (const card of cards) {
+        if (cardsByColumn[card.columnId]) {
+          cardsByColumn[card.columnId].push(card);
+        }
+      }
+      renderBoard();
+      connectWs();
+    });
+  }
+
+  function renderBoard() {
+    board.innerHTML = "";
+    if (columns.length === 0) {
+      board.innerHTML = '<div class="empty">No columns yet. Create one via the API.</div>';
+      return;
+    }
+    for (const col of columns) {
+      const colEl = document.createElement("div");
+      colEl.className = "column";
+      colEl.innerHTML = '<h2>' + escHtml(col.name) + '</h2>';
+      const colCards = cardsByColumn[col.id] || [];
+      if (colCards.length === 0) {
+        colEl.innerHTML += '<div class="empty">No cards</div>';
+      }
+      for (const card of colCards) {
+        const cardEl = document.createElement("div");
+        cardEl.className = "card";
+        cardEl.innerHTML = '<div class="title">' + escHtml(card.title) + '</div>' +
+          '<div class="meta">' +
+          (card.retryCount > 0 ? '<span class="retry">retry ' + card.retryCount + '</span> ' : '') +
+          escHtml(card.id.slice(0, 8)) +
+          '</div>';
+        cardEl.addEventListener("click", () => openModal(card));
+        colEl.appendChild(cardEl);
+      }
+      board.appendChild(colEl);
+    }
+  }
+
+  function openModal(card) {
+    modalTitle.textContent = card.title;
+    modalMeta.textContent = "ID: " + card.id + " | Column: " + (getColumnName(card.columnId) || "?") + " | Retries: " + card.retryCount;
+    modalBody.textContent = card.body || "(no body)";
+
+    threadsList.innerHTML = "";
+    attemptsList.innerHTML = "";
+
+    fetch("/api/cards/" + card.id).then(r => r.json()).then(data => {
+      if (data.threads && data.threads.length > 0) {
+        for (const entry of data.threads) {
+          const el = document.createElement("div");
+          el.className = "thread-entry";
+          let content = entry.content;
+          try { content = JSON.parse(content); } catch {}
+          if (typeof content === "object") {
+            el.textContent = "[" + entry.entryType + "] " + (content.reason || content.actor || content.from || JSON.stringify(content));
+          } else {
+            el.textContent = "[" + entry.entryType + "] " + content;
+          }
+          el.style.color = "#aaa";
+          threadsList.appendChild(el);
+        }
+      } else {
+        threadsList.innerHTML = '<div class="empty">No activity yet</div>';
+      }
+
+      if (data.attempts && data.attempts.length > 0) {
+        for (const att of data.attempts) {
+          const el = document.createElement("div");
+          el.className = "attempt";
+          const v = att.verdict ? (att.verdict.verdict || JSON.stringify(att.verdict)) : "—";
+          el.innerHTML = '<span class="verdict ' + (v === "pass" ? "pass" : v === "fail" ? "fail" : "blocked") + '">' + escHtml(String(v)) + '</span>' +
+            (att.transcriptPath ? ' — ' + escHtml(att.transcriptPath) : '');
+          attemptsList.appendChild(el);
+        }
+      } else {
+        attemptsList.innerHTML = '<div class="empty">No attempts yet</div>';
+      }
+    });
+
+    moveColumn.innerHTML = "";
+    for (const col of columns) {
+      if (col.id !== card.columnId) {
+        const opt = document.createElement("option");
+        opt.value = col.id;
+        opt.textContent = col.name;
+        moveColumn.appendChild(opt);
+      }
+    }
+    moveReason.value = "";
+    overlay.classList.add("open");
+  }
+
+  function closeModal() {
+    overlay.classList.remove("open");
+  }
+
+  moveBtn.addEventListener("click", () => {
+    const cardTitle = modalTitle.textContent;
+    const cardId = findCardIdByTitle(cardTitle);
+    if (!cardId) return;
+    const toColumnId = moveColumn.value;
+    if (!toColumnId) return;
+    const reason = moveReason.value;
+    fetch("/api/cards/" + cardId + "/move", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ to_column_id: toColumnId, reason: reason }),
+    }).then(() => {
+      closeModal();
+      if (currentProject) loadBoard(currentProject);
+    });
+  });
+
+  modalClose.addEventListener("click", closeModal);
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closeModal(); });
+
+  function findCardIdByTitle(title) {
+    for (const col of columns) {
+      const cs = cardsByColumn[col.id] || [];
+      for (const c of cs) {
+        if (c.title === title) return c.id;
+      }
+    }
+    return null;
+  }
+
+  function getColumnName(colId) {
+    const col = columns.find(c => c.id === colId);
+    return col ? col.name : null;
+  }
+
+  function connectWs() {
+    if (ws) {
+      ws.close();
+    }
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(proto + "//" + location.host + "/ws");
+    ws.onopen = () => {
+      statusEl.textContent = "connected";
+      statusEl.className = "connected";
+      if (currentProject) {
+        ws.send(JSON.stringify({ type: "subscribe", projectId: currentProject }));
+      }
+    };
+    ws.onclose = () => {
+      statusEl.textContent = "disconnected";
+      statusEl.className = "disconnected";
+    };
+    ws.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.projectId === currentProject) {
+          if (msg.type === "card.moved" || msg.type === "card.created" || msg.type === "card.deleted" ||
+              msg.type === "card.updated" || msg.type === "column.created" || msg.type === "column.deleted" ||
+              msg.type === "column.updated") {
+            if (currentProject) loadBoard(currentProject);
+          }
+        }
+      } catch {}
+    };
+  }
+
+  projectSelect.addEventListener("change", () => {
+    const val = projectSelect.value;
+    if (val) loadBoard(val);
+  });
+
+  function escHtml(s) {
+    const d = document.createElement("div");
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  loadProjects();
+})();
+</script>
+</body>
+</html>

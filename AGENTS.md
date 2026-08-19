@@ -14,7 +14,14 @@ order is `docs/plans/2026-08-17-clockwork-implementation-plan.md`.
 | Command | Purpose |
 |---------|---------|
 | `bun install` | Install dependencies |
-| `bun test` | Run the full test suite (the gate) |
+| `bun run check` | **The gate: `tsc --noEmit` + `bun test`.** Run this before committing. |
+| `bun test` | Run the test suite only |
+| `bun run typecheck` | Type-check only (`tsc --noEmit`) |
+
+**Always run `bun run check`, not just `bun test`.** A green test suite alone once hid 145
+type errors and a completely unwired integration layer (`index.ts` didn't compile; the worker
+never assembled context, recorded attempts, or respected park columns). Type-check is
+non-negotiable.
 
 ## Non-negotiables (from the design)
 
