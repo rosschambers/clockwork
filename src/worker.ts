@@ -27,6 +27,8 @@ export interface WorkerConfig {
 	projectRoot: string
 	transcriptsDir: string
 	tokenBudget?: number
+	// pi provider (endpoint) for all sessions. Defaults to the arbiter LOW port.
+	piProvider?: string
 	onEvent?: (e: WorkerEvent) => void
 	notifyUrl?: string
 	notifyToken?: string
@@ -52,10 +54,18 @@ export interface PiResult {
 export interface PiInvocation {
 	prompt: string
 	cwd: string
+	// pi provider carrying the endpoint. Defaults to the arbiter LOW port
+	// (frame-dense-low) so clockwork work is background/preemptible by design.
+	provider?: string
 	model?: string
 	skills?: string[]
 	env?: Record<string, string>
 }
+
+// clockwork is background work by definition, so it targets the frame-arbiter
+// LOW port (a Hugo request preempts it). This is the provider the container's
+// pi config must define -> http://frame:8185/v1 (dense 27B).
+export const DEFAULT_PI_PROVIDER = "frame-dense-low"
 
 // Run one pi session non-interactively against a frame model. The prompt is the
 // fully-assembled context (column prompt + card + memory). Model + skills come
@@ -63,8 +73,9 @@ export interface PiInvocation {
 // `.exited` and read the piped streams.
 export async function invokePi(invocation: PiInvocation): Promise<PiResult> {
 	const args = ["pi", "-p"]
+	args.push("--provider", invocation.provider ?? DEFAULT_PI_PROVIDER)
 	if (invocation.model) {
-		args.push("--provider", "frame", "--model", invocation.model)
+		args.push("--model", invocation.model)
 	}
 	for (const skill of invocation.skills ?? []) {
 		args.push("--skill", skill)
@@ -121,6 +132,7 @@ export class Worker {
 	public readonly projectRoot: string
 	public readonly transcriptsDir: string
 	public readonly tokenBudget: number | undefined
+	public readonly piProvider: string
 	public readonly onEvent: ((e: WorkerEvent) => void) | undefined
 	public readonly notifyUrl: string | undefined
 	public readonly notifyToken: string | undefined
@@ -139,6 +151,7 @@ export class Worker {
 		this.projectRoot = config.projectRoot
 		this.transcriptsDir = config.transcriptsDir
 		this.tokenBudget = config.tokenBudget
+		this.piProvider = config.piProvider ?? DEFAULT_PI_PROVIDER
 		this.onEvent = config.onEvent
 		this.notifyUrl = config.notifyUrl
 		this.notifyToken = config.notifyToken
@@ -262,6 +275,7 @@ export class Worker {
 		const result = await invokeFn({
 			prompt: assembled.systemPrompt,
 			cwd: this.projectRoot,
+			provider: this.piProvider,
 			model: column.model ?? undefined,
 			skills: column.skills,
 			env: {
