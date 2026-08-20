@@ -166,6 +166,15 @@ function isParkColumn(column: DbColumn): boolean {
 		name.includes("needs human") || name.includes("needs director")
 }
 
+// The terminal column — a card here is finished. moveForward MAY advance a card
+// INTO it, but the worker must never CLAIM a card that is already in it (else it
+// re-runs the model on a done card forever, getting "No next column" -> a tight
+// loop that also starves the other cards on a single worker). Distinct from
+// isParkColumn because Done is still a real pipeline column for movement.
+function isTerminalColumn(column: DbColumn): boolean {
+	return column.name.toLowerCase().trim() === "done"
+}
+
 export class Worker {
 	public readonly dbStore: DbStore
 	public readonly projectId: string
@@ -262,13 +271,17 @@ export class Worker {
 	}
 
 	private async claimCard(): Promise<DbCard | null> {
-		const parkIds = new Set(
-			this.dbStore.getColumnsByProject(this.projectId).filter(isParkColumn).map((c) => c.id)
+		// Never claim from park (needs-human/director) OR terminal (Done) columns.
+		const unclaimableColumnIds = new Set(
+			this.dbStore
+				.getColumnsByProject(this.projectId)
+				.filter((c) => isParkColumn(c) || isTerminalColumn(c))
+				.map((c) => c.id),
 		)
 		const eligible = this.dbStore.getCardsByProject(this.projectId).filter((card) => {
 			if (card.claimState !== null) return false
 			if (card.retryCount >= this.maxRetries) return false
-			if (parkIds.has(card.columnId)) return false
+			if (unclaimableColumnIds.has(card.columnId)) return false
 			return true
 		})
 

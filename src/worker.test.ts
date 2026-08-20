@@ -361,6 +361,29 @@ describe("Worker — max retries -> needsHuman", () => {
 	})
 })
 
+describe("Worker — never claims a card in the terminal Done column", () => {
+	it("a card in Done is not claimed (no re-run loop on finished cards)", async () => {
+		const { store, path } = createTempDb()
+		const seeded = seedTestData(store)
+		const done = store.createColumn({
+			projectId: seeded.projectId, name: "Done", prompt: "done",
+			skills: [], model: null, position: 99,
+		})
+		// Move the only card into Done.
+		store.moveCard(seeded.cardId, done.id, 0, false)
+
+		const worker = new Worker({
+			dbStore: store, projectId: seeded.projectId, token: "", workerId: "w",
+			projectRoot: "/tmp", transcriptsDir: "/tmp/clockwork-transcripts",
+			pollIntervalMs: 50, maxRetries: 3,
+		})
+		expect(await worker["claimCard"]()).toBeNull()
+
+		store.close()
+		fs.unlinkSync(path)
+	})
+})
+
 describe("Worker — no cards -> idle", () => {
 	let store: DbStore
 	let path: string
