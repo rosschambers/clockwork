@@ -2,9 +2,15 @@
 # pi is a Node CLI (@earendil-works/pi-coding-agent), so the image needs Node too.
 FROM oven/bun:1-debian
 
-# Node (for pi) + git/openssh (the worker clones/commits the project repo).
+# git/openssh (the worker clones/commits the project repo) + curl for the Node setup.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-	nodejs npm git openssh-client ca-certificates \
+	git openssh-client ca-certificates curl \
+	&& rm -rf /var/lib/apt/lists/*
+
+# pi 0.84.2 needs a MODERN Node (its bundled undici calls markAsUncloneable, which
+# debian's apt nodejs is too old for). Install Node 22 LTS from nodesource.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+	&& apt-get install -y --no-install-recommends nodejs \
 	&& rm -rf /var/lib/apt/lists/*
 
 # Install the pi CLI globally so `pi` is on PATH for the worker.
