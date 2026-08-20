@@ -1,4 +1,4 @@
-import { parseVerdict, type Verdict } from "./verdict.ts"
+import { parseVerdict, isParseFailureVerdict, type Verdict } from "./verdict.ts"
 import { DbStore, type DbCard, type DbColumn } from "./db.ts"
 import { notify, columnNotificationType, type NotifyEvent } from "./notify.ts"
 import { assembleContext, type ThreadEntry } from "./context.ts"
@@ -66,6 +66,15 @@ export interface PiInvocation {
 // LOW port (a Hugo request preempts it). This is the provider the container's
 // pi config must define -> http://frame:8185/v1 (dense 27B).
 export const DEFAULT_PI_PROVIDER = "frame-dense-low"
+
+// C4 extraction fallback prompt: when the work session omitted the verdict JSON,
+// a second call reads the transcript and emits ONLY the verdict object.
+const EXTRACTION_PROMPT = `You are a verdict extractor. Read the agent transcript below and decide the outcome of the stage. Output EXACTLY ONE JSON object and NOTHING else:
+{"verdict": "pass" | "fail" | "blocked", "feedback": "<one sentence>", "artifacts": []}
+- "pass": the transcript shows the stage's work was completed successfully.
+- "fail": the work was attempted but did not meet the bar.
+- "blocked": the agent could not proceed.
+Do not add any prose before or after the JSON.`
 
 // Run one pi session non-interactively against a frame model. The prompt is the
 // fully-assembled context (column prompt + card + memory). Model + skills come
@@ -292,7 +301,32 @@ export class Worker {
 			},
 		})
 
-		const verdict = parseVerdict(result.stdout)
+		let verdict = parseVerdict(result.stdout)
+
+		// C4 — grammar-constrained verdict extraction fallback. If the verdict is
+		// blocked ONLY because the output had no parseable verdict (the model did the
+		// work but omitted the JSON trailer — common with reasoning models), make a
+		// SECOND, tightly-constrained call that asks the model to read its own
+		// transcript and emit ONLY the verdict JSON. A model-declared block is left
+		// alone (nothing to rescue).
+		if (isParseFailureVerdict(verdict)) {
+			try {
+				const extraction = await invokeFn({
+					prompt: EXTRACTION_PROMPT + "\n\n<transcript>\n" + result.stdout.slice(-6000) + "\n</transcript>",
+					cwd: this.projectRoot,
+					provider: this.piProvider,
+					model: column.model ?? undefined,
+					env: { CLOCKWORK_CARD_ID: card.id },
+				})
+				const rescued = parseVerdict(extraction.stdout)
+				if (!isParseFailureVerdict(rescued)) {
+					verdict = rescued
+				}
+			} catch {
+				// Extraction is best-effort; on failure keep the blocked verdict
+				// (which now resolves the card via kickback, not a stall).
+			}
+		}
 
 		// Persist the full transcript + verdict as an attempt (the check-in
 		// debugging surface). NONE of this may throw out of processCard: a

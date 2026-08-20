@@ -92,6 +92,22 @@ function normalizeVerdict(raw: Verdict): Verdict {
 	}
 }
 
+// The feedback strings parseVerdict uses when it could NOT parse a verdict from
+// the output (as opposed to the model explicitly declaring blocked). The worker
+// uses this to decide whether to run the grammar-constrained extraction fallback.
+const PARSE_FAILURE_FEEDBACK = new Set<string>([
+	"Empty output",
+	"No JSON found in output",
+	"Malformed verdict",
+])
+
+// True when a verdict is `blocked` ONLY because the output could not be parsed —
+// i.e. the model likely did the work but omitted the JSON verdict trailer. This
+// is the case the extraction fallback should rescue.
+export function isParseFailureVerdict(verdict: Verdict): boolean {
+	return verdict.verdict === "blocked" && PARSE_FAILURE_FEEDBACK.has(verdict.feedback)
+}
+
 export function parseVerdict(output: string): Verdict {
 	const trimmed = output.trim()
 

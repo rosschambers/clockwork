@@ -593,6 +593,50 @@ describe("Worker — malformed verdict -> blocked", () => {
 		await worker.stopped()
 	})
 
+	it("no verdict trailer -> the extraction fallback rescues the real verdict (C4)", async () => {
+		// The model wrote work but omitted the {"verdict":...} JSON. The first pi
+		// call returns prose only -> parse-failure blocked. The worker then makes a
+		// SECOND (extraction) call that returns a clean verdict, and the card advances
+		// as that verdict says instead of stalling.
+		store.createColumn({
+			projectId, name: "Done", prompt: "final", skills: [], model: null, position: 1,
+		})
+		const events: WorkerEvent[] = []
+		const worker = new Worker({
+			dbStore: store,
+			projectId,
+			token: "test",
+			workerId: "test-worker",
+			projectRoot: "/tmp",
+			transcriptsDir: "/tmp/clockwork-transcripts",
+			pollIntervalMs: 50,
+			maxRetries: 3,
+			onEvent: (e) => events.push(e),
+		})
+
+		let call = 0
+		worker.invokePi = mock((_invocation) => {
+			call++
+			if (call === 1) {
+				// First (work) call: prose, no verdict trailer.
+				return Promise.resolve({ stdout: "I created scripts/beam.gd with the logic.", stderr: "", exitCode: 0 })
+			}
+			// Second (extraction) call: a clean verdict.
+			return Promise.resolve({ stdout: '{"verdict":"pass","feedback":"work completed","artifacts":[]}', stderr: "", exitCode: 0 })
+		})
+
+		const card0 = await worker["claimCard"]()
+		await worker.processCard(card0!)
+
+		expect(call).toBe(2) // the fallback fired
+		const card = store.getCardById(cardId)!
+		expect(card.columnId).not.toBe(columnId) // advanced to Done via the rescued pass
+		expect(card.claimState).toBeNull()
+
+		worker.stop()
+		await worker.stopped()
+	})
+
 	it("a transcript-write failure does NOT lose the attempt or strand the card", async () => {
 		// saveTranscript must not be able to kill processCard. Point transcriptsDir
 		// at an un-writable path; the attempt is still recorded (transcriptPath null)
