@@ -60,7 +60,13 @@ export interface PiInvocation {
 	model?: string
 	skills?: string[]
 	env?: Record<string, string>
+	// Watchdog: kill pi after this many ms so a hung session can't strand a card.
+	timeoutMs?: number
 }
+
+// Generous default watchdog — the local model is slow but free, so allow a long
+// session, but never infinite (a hang must resolve the card, not vanish it).
+const DEFAULT_PI_TIMEOUT_MS = 15 * 60 * 1000
 
 // clockwork is background work by definition, so it targets the frame-arbiter
 // LOW port (a Hugo request preempts it). This is the provider the container's
@@ -106,13 +112,34 @@ export async function invokePi(invocation: PiInvocation): Promise<PiResult> {
 	// text only resolves at EOF (process exit); doing them concurrently avoids a
 	// pipe-buffer deadlock where one full pipe blocks the process while we await
 	// the other.
-	const [stdout, stderr] = await Promise.all([
-		Bun.readableStreamToText(proc.stdout),
-		Bun.readableStreamToText(proc.stderr),
-		proc.exited,
-	]) as [string, string, number]
+	//
+	// WATCHDOG: the local model is slow-but-free, so the timeout is generous — but
+	// it MUST exist. Some prompts have hung pi indefinitely after the model already
+	// finished (content-specific, under investigation); without a watchdog that
+	// strands the card forever. On timeout we kill pi and return what we have, so
+	// the caller records a blocked attempt and the card resolves (retry ->
+	// needs-human) instead of vanishing.
+	const timeoutMs = invocation.timeoutMs ?? DEFAULT_PI_TIMEOUT_MS
+	let timedOut = false
+	const collected = { out: "", err: "" }
+	const readOut = Bun.readableStreamToText(proc.stdout).then((t) => (collected.out = t))
+	const readErr = Bun.readableStreamToText(proc.stderr).then((t) => (collected.err = t))
+	const watchdog = new Promise<void>((resolve) => {
+		setTimeout(() => {
+			timedOut = true
+			try {
+				proc.kill()
+			} catch {}
+			resolve()
+		}, timeoutMs)
+	})
+	await Promise.race([Promise.all([readOut, readErr, proc.exited]), watchdog])
 
-	return { stdout, stderr, exitCode: proc.exitCode ?? 0 }
+	return {
+		stdout: collected.out,
+		stderr: timedOut ? collected.err + `\n[clockwork: pi killed after ${timeoutMs}ms watchdog]` : collected.err,
+		exitCode: timedOut ? 124 : proc.exitCode ?? 0,
+	}
 }
 
 function emitEvent(
