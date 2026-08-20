@@ -549,7 +549,11 @@ describe("Worker — malformed verdict -> blocked", () => {
 		fs.unlinkSync(path)
 	})
 
-	it("malformed verdict -> card stays in same column", async () => {
+	it("malformed verdict -> records an attempt, unclaims, and counts as a retry (no stall)", async () => {
+		// A blocked verdict (e.g. the model wrote code but no JSON verdict trailer)
+		// must NOT strand the card: it records an attempt, unclaims the card, and
+		// increments retry so repeated no-verdict runs eventually park at needs-human
+		// rather than looping/vanishing silently.
 		const events: WorkerEvent[] = []
 		const worker = new Worker({
 			dbStore: store,
@@ -569,18 +573,59 @@ describe("Worker — malformed verdict -> blocked", () => {
 			exitCode: 0,
 		}
 
-		worker.invokePi = mock(
-			(_invocation) =>
-				Promise.resolve(fakeResult)
-		)
+		worker.invokePi = mock((_invocation) => Promise.resolve(fakeResult))
 
-		await startWorker(worker)
+		const card0 = await worker["claimCard"]()
+		expect(card0).not.toBeNull()
+		await worker.processCard(card0!)
 
 		const card = store.getCardById(cardId)
 		expect(card).not.toBeNull()
-		expect(card!.columnId).toBe(columnId)
-		expect(card!.retryCount).toBe(0)
+		// An attempt was recorded (the debugging surface must never be empty).
+		expect(store.getAttemptsByCard(cardId).length).toBe(1)
+		// The card is not left claimed by a finished run.
+		expect(card!.claimState).toBeNull()
+		// Blocked counts as a retry so it progresses toward needs-human.
+		expect(card!.retryCount).toBe(1)
 		expect(events.some((e) => e.type === "blocked")).toBe(true)
+
+		worker.stop()
+		await worker.stopped()
+	})
+
+	it("a transcript-write failure does NOT lose the attempt or strand the card", async () => {
+		// saveTranscript must not be able to kill processCard. Point transcriptsDir
+		// at an un-writable path; the attempt is still recorded (transcriptPath null)
+		// and the card is resolved, not left claimed.
+		const events: WorkerEvent[] = []
+		const worker = new Worker({
+			dbStore: store,
+			projectId,
+			token: "test",
+			workerId: "test-worker",
+			projectRoot: "/tmp",
+			// A path that cannot be created (a file exists where a dir is needed).
+			transcriptsDir: "/dev/null/cannot-mkdir-here",
+			pollIntervalMs: 50,
+			maxRetries: 3,
+			onEvent: (e) => events.push(e),
+		})
+
+		worker.invokePi = mock((_invocation) =>
+			Promise.resolve({
+				stdout: JSON.stringify({ verdict: "pass", feedback: "ok", artifacts: [] }),
+				stderr: "",
+				exitCode: 0,
+			}),
+		)
+
+		const card0 = await worker["claimCard"]()
+		await worker.processCard(card0!)
+
+		// Attempt recorded despite the transcript write failing.
+		expect(store.getAttemptsByCard(cardId).length).toBe(1)
+		// Card resolved (not left claimed by a crash).
+		expect(store.getCardById(cardId)!.claimState).toBeNull()
 
 		worker.stop()
 		await worker.stopped()

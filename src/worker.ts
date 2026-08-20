@@ -202,7 +202,14 @@ export class Worker {
 			}
 
 			emitEvent(this.onEvent, { type: "claimed", cardId: card.id })
-			await this.processCard(card)
+			try {
+				await this.processCard(card)
+			} catch (err) {
+				// Crash safety: a card must NEVER be left claimed by a thrown
+				// processCard. Unclaim it, surface the error, keep the loop alive.
+				this.dbStore.unclaimCard(card.id)
+				emitEvent(this.onEvent, { type: "blocked", cardId: card.id, reason: `processCard threw: ${String(err)}` })
+			}
 		}
 	}
 
@@ -288,8 +295,15 @@ export class Worker {
 		const verdict = parseVerdict(result.stdout)
 
 		// Persist the full transcript + verdict as an attempt (the check-in
-		// debugging surface). Never let a persistence hiccup lose the verdict.
-		const transcriptPath = this.saveTranscript(card, result)
+		// debugging surface). NONE of this may throw out of processCard: a
+		// transcript-write failure must degrade to a null path but still record the
+		// attempt, and any persistence hiccup must not leave the card claimed.
+		let transcriptPath: string | null = null
+		try {
+			transcriptPath = this.saveTranscript(card, result)
+		} catch (err) {
+			emitEvent(this.onEvent, { type: "blocked", cardId: card.id, reason: `transcript write failed (continuing): ${String(err)}` })
+		}
 		try {
 			this.dbStore.createAttempt({
 				cardId: card.id,
@@ -317,11 +331,12 @@ export class Worker {
 				break
 			}
 			case "blocked": {
-				emitEvent(this.onEvent, {
-					type: "blocked",
-					cardId: card.id,
-					reason: verdict.feedback,
-				})
+				// A blocked verdict (often: the model produced work but no parseable
+				// JSON verdict trailer) must RESOLVE the card, not strand it. Treat it
+				// as a retry via the same kickback path so repeated no-verdict runs
+				// eventually park at needs-human instead of looping/vanishing.
+				emitEvent(this.onEvent, { type: "blocked", cardId: card.id, reason: verdict.feedback })
+				await this.kickback(card, verdict)
 				break
 			}
 		}
@@ -349,7 +364,9 @@ export class Worker {
 		const currentIndex = columns.findIndex((c) => c.id === card.columnId)
 
 		if (currentIndex < 0 || currentIndex >= columns.length - 1) {
-			// Already at last column or column not found — stay put
+			// Already at last column or column not found — stay put, but ALWAYS
+			// unclaim so the card is never left held by a finished run.
+			this.dbStore.unclaimCard(card.id)
 			emitEvent(this.onEvent, {
 				type: "blocked",
 				cardId: card.id,
