@@ -16,6 +16,19 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 # Install the pi CLI globally so `pi` is on PATH for the worker.
 RUN npm install -g @earendil-works/pi-coding-agent@0.84.2
 
+# Godot 4 (headless) so Implementation/QA cards can validate the game: open headless,
+# run the test suite. This is the HEADLESS binary for logic/build checks — it does NOT
+# render (rendering runs on studio's GPU via harness/render-on-studio.sh over SSH).
+# unzip to fetch the official Linux build.
+RUN apt-get update && apt-get install -y --no-install-recommends unzip \
+	&& curl -fsSL -o /tmp/godot.zip \
+	   https://github.com/godotengine/godot/releases/download/4.3-stable/Godot_v4.3-stable_linux.x86_64.zip \
+	&& unzip -q /tmp/godot.zip -d /usr/local/bin \
+	&& mv /usr/local/bin/Godot_v4.3-stable_linux.x86_64 /usr/local/bin/godot \
+	&& chmod +x /usr/local/bin/godot \
+	&& rm /tmp/godot.zip \
+	&& apt-get purge -y unzip && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 COPY package.json ./
 RUN bun install
