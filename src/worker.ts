@@ -93,16 +93,24 @@ export async function invokePi(invocation: PiInvocation): Promise<PiResult> {
 
 	const proc = Bun.spawn(args, {
 		cwd: invocation.cwd,
+		// stdin MUST be closed: pi may block waiting on stdin otherwise, leaving the
+		// process alive/unread and our stream reads never reaching EOF (a hang that
+		// stalled the whole worker — diagnosed live 2026-08-19).
+		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
 		env: { ...process.env, ...(invocation.env ?? {}) },
 	})
 
+	// Drain both pipes concurrently AND wait for exit together. Reading a pipe to
+	// text only resolves at EOF (process exit); doing them concurrently avoids a
+	// pipe-buffer deadlock where one full pipe blocks the process while we await
+	// the other.
 	const [stdout, stderr] = await Promise.all([
-		new Response(proc.stdout).text(),
-		new Response(proc.stderr).text(),
-	])
-	await proc.exited
+		Bun.readableStreamToText(proc.stdout),
+		Bun.readableStreamToText(proc.stderr),
+		proc.exited,
+	]) as [string, string, number]
 
 	return { stdout, stderr, exitCode: proc.exitCode ?? 0 }
 }
