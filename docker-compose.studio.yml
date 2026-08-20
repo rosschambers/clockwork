@@ -1,0 +1,19 @@
+# Studio deployment override: run clockwork on studio (RTX 3060) so the worker can
+# render Godot scenes LOCALLY on the GPU — no serve<->studio SSH transport. Board at
+# studio:3000. Temporary until serve gets a GPU (see the exocortex inbox item).
+#
+# Deploy on studio:
+#   CLOCKWORK_BIND=100.111.182.106 docker compose -f docker-compose.yml -f docker-compose.studio.yml up -d --build
+services:
+  clockwork:
+    # RTX 3060 via the nvidia-container-toolkit CDI spec (hardware.nvidia-container-toolkit
+    # is enabled on studio). Injects the GPU device nodes + NVIDIA userspace driver libs.
+    devices:
+      - "nvidia.com/gpu=all"
+    environment:
+      # The Vulkan loader inside the (Debian) image can't find the CDI-injected NVIDIA
+      # driver without this — the Grimoire gotcha. Points the loader at the injected ICD.
+      - VK_ICD_FILENAMES=/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json
+      - VK_DRIVER_FILES=/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json
+      # The worker renders locally on studio now (harness/render-on-studio.sh runs here).
+      - CLOCKWORK_RENDER_HOST=local

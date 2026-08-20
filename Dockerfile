@@ -2,9 +2,13 @@
 # pi is a Node CLI (@earendil-works/pi-coding-agent), so the image needs Node too.
 FROM oven/bun:1-debian
 
-# git/openssh (the worker clones/commits the project repo) + curl for the Node setup.
+# git/openssh (worker clones/commits) + curl (Node setup) + xvfb & the Vulkan loader
+# so the worker can RENDER Godot locally on the host GPU (studio's RTX 3060 via the
+# nvidia-container-toolkit CDI passthrough). The NVIDIA ICD/driver libs are injected
+# at runtime by the CDI spec; we set VK_ICD_FILENAMES to point the loader at them.
 RUN apt-get update && apt-get install -y --no-install-recommends \
 	git openssh-client ca-certificates curl \
+	xvfb libvulkan1 vulkan-tools libgl1 \
 	&& rm -rf /var/lib/apt/lists/*
 
 # pi 0.84.2 needs a MODERN Node (its bundled undici calls markAsUncloneable, which
