@@ -51,6 +51,7 @@ const server = startServer({
 console.log(`  server listening on :${server.port}`)
 console.log(`  worker project: ${WORKER_PROJECT_ID ?? "(none)"}`)
 
+let lastIdleLog = 0
 if (WORKER_PROJECT_ID) {
 	const worker = new Worker({
 		dbStore,
@@ -63,6 +64,18 @@ if (WORKER_PROJECT_ID) {
 		pollIntervalMs: Number(process.env.CLOCKWORK_POLL_INTERVAL_MS ?? 5000),
 		notifyUrl: process.env.CLOCKWORK_NOTIFY_URL,
 		notifyToken: process.env.CLOCKWORK_NOTIFY_TOKEN,
+		// Observability: log every worker event so the durable service's journal
+		// shows the board moving (idle is noisy — log it at most once per minute).
+		onEvent: (e) => {
+			if (e.type === "idle") {
+				const now = Date.now()
+				if (now - lastIdleLog < 60000) {
+					return
+				}
+				lastIdleLog = now
+			}
+			console.log(`[worker ${new Date().toISOString()}] ${JSON.stringify(e)}`)
+		},
 	})
 	worker.start()
 	console.log("  worker started")
