@@ -1,0 +1,27 @@
+services:
+  clockwork:
+    build: .
+    # Bind to the tailnet + loopback only (household-private, per the design).
+    # serve's tailnet IP is set via CLOCKWORK_BIND (deploy.sh resolves it).
+    ports:
+      - "${CLOCKWORK_BIND:-127.0.0.1}:3000:3000"
+    volumes:
+      - clockwork-data:/data
+      - ./memory:/data/memory
+    environment:
+      - NODE_ENV=production
+      - CLOCKWORK_PORT=3000
+      - CLOCKWORK_DB_PATH=/data/db/clockwork.sqlite
+      - CLOCKWORK_REPOS=/data/repos
+      - CLOCKWORK_TRANSCRIPTS=/data/transcripts
+      - CLOCKWORK_ARTIFACTS=/data/artifacts
+      - CLOCKWORK_TOKEN=${CLOCKWORK_TOKEN:-}
+      - CLOCKWORK_NOTIFY_URL=${CLOCKWORK_NOTIFY_URL:-}
+      - CLOCKWORK_NOTIFY_TOKEN=${CLOCKWORK_NOTIFY_TOKEN:-}
+      - CLOCKWORK_GIT_TOKEN=${CLOCKWORK_GIT_TOKEN:-}
+      # Set to a project id to start the worker loop for that project.
+      - CLOCKWORK_WORKER_PROJECT_ID=${CLOCKWORK_WORKER_PROJECT_ID:-}
+    restart: unless-stopped
+
+volumes:
+  clockwork-data:

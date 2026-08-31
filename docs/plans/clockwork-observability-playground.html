@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clockwork Observability — Board Playground</title>
+<style>
+  :root{
+    /* clockwork's real palette (from public/index.html) */
+    --bg:#1a1a2e; --col:#16213e; --card:#0f3460; --card-hover:#1a4a7a;
+    --accent:#e94560; --accent2:#533483; --line:#0f3460; --ink:#e8ecf5; --muted:#8a93a8;
+    --good:#3fb950; --warn:#d29922; --bad:#f85149; --cyan:#3fd8ff; --pane:#12182b;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:#0c1020;color:var(--ink);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;display:flex;min-height:100vh}
+  .mono{font-family:"JetBrains Mono","Fira Code",ui-monospace,monospace}
+
+  /* controls */
+  #controls{width:320px;min-width:320px;height:100vh;overflow-y:auto;background:var(--pane);border-right:1px solid #232b45;padding:16px 16px 40px}
+  #controls h1{font-size:15px;margin:0 0 2px}
+  #controls .sub{color:var(--muted);font-size:11px;margin:0 0 14px;line-height:1.5}
+  .group{border:1px solid #232b45;border-radius:9px;padding:11px;margin-bottom:12px;background:#0f1526}
+  .group h2{font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);margin:0 0 9px}
+  .row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:8px 0}
+  .row label{font-size:12.5px}
+  .row .val{font-size:11px;color:var(--cyan);min-width:36px;text-align:right}
+  input[type=range]{width:140px;accent-color:var(--accent)}
+  input[type=checkbox]{width:15px;height:15px;accent-color:var(--accent)}
+  select{background:#0b1020;color:var(--ink);border:1px solid #2a3350;border-radius:6px;padding:4px 6px;font-size:12px}
+  .seg{display:flex;gap:4px;flex-wrap:wrap}
+  .seg button{flex:1 1 auto;background:#0b1020;color:var(--ink);border:1px solid #2a3350;border-radius:6px;padding:6px 6px;font-size:11px;cursor:pointer}
+  .seg button.on{border-color:var(--accent);color:#fff;background:#2a1622}
+  .presets{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px}
+  .presets button{flex:1 1 auto;background:#0b1020;color:var(--ink);border:1px solid #2a3350;border-radius:7px;padding:7px;font-size:11px;cursor:pointer}
+  .presets button:hover{border-color:var(--cyan);color:var(--cyan)}
+
+  /* stage */
+  #stage{flex:1;display:flex;flex-direction:column;min-width:0}
+  #board-wrap{flex:1;overflow:auto;padding:0}
+  #promptBox{background:var(--pane);border-top:1px solid #232b45;padding:10px 14px;max-height:210px;overflow:auto}
+  #promptBox .phead{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+  #promptBox h3{font-size:10px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted);margin:0}
+  #copyBtn{background:var(--accent);color:#fff;border:none;border-radius:6px;padding:6px 12px;font-size:12px;font-weight:600;cursor:pointer}
+  #promptText{font-size:11.5px;line-height:1.55;white-space:pre-wrap;margin:0;color:var(--ink)}
+
+  /* ===== the actual board being designed ===== */
+  .board-app{background:var(--bg);min-height:100%;padding:0}
+  /* top bar */
+  .topbar{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;border-bottom:1px solid #232b45;position:sticky;top:0;background:var(--bg);z-index:5}
+  .topbar .brand{font-size:16px;font-weight:700;letter-spacing:.5px}
+  .topbar .brand small{color:var(--muted);font-weight:400;font-size:12px;margin-left:8px}
+  .conn{font-size:11px;color:var(--good)}
+  /* stats header bar */
+  .stats{display:flex;gap:14px;align-items:stretch;padding:12px 18px;border-bottom:1px solid #232b45;background:#141a30;flex-wrap:wrap}
+  .stat{display:flex;flex-direction:column;gap:2px;min-width:78px}
+  .stat .k{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+  .stat .v{font-size:19px;font-weight:700}
+  .stat .v.bad{color:var(--bad)} .stat .v.good{color:var(--good)} .stat .v.cyan{color:var(--cyan)}
+  .spark{display:flex;align-items:flex-end;gap:2px;height:34px;padding-top:4px}
+  .spark .b{width:6px;background:var(--accent);border-radius:1px;opacity:.85}
+  .graphwrap{flex:1;min-width:220px;display:flex;flex-direction:column;gap:3px}
+  .graphwrap .glabel{font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}
+  .areagraph{height:40px;width:100%}
+
+  /* columns */
+  .cols{display:flex;gap:12px;padding:16px 18px;overflow-x:auto;align-items:flex-start}
+  .column{min-width:270px;max-width:300px;background:var(--col);border-radius:8px;padding:10px;flex-shrink:0}
+  .column h2{font-size:12px;text-transform:uppercase;letter-spacing:1px;color:var(--accent);margin:0 0 4px;padding-bottom:7px;border-bottom:2px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+  .column h2 .cnt{font-size:11px;color:var(--muted);font-weight:400}
+
+  /* the CARD — the star of the show */
+  .card{background:var(--card);border-radius:7px;padding:10px;margin-bottom:8px;cursor:pointer;border-left:3px solid var(--accent2);position:relative;transition:background .15s, transform .1s}
+  .card:hover{background:var(--card-hover);transform:translateY(-1px)}
+  .card.running{border-left-color:var(--good)}
+  .card.blocked{border-left-color:var(--bad)}
+  .card.done{border-left-color:var(--good);opacity:.72}
+  .card .title{font-weight:600;font-size:13px;margin-bottom:6px;line-height:1.3}
+  .card .status-dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .dot-run{background:var(--good);box-shadow:0 0 0 0 rgba(63,185,80,.6);animation:pulse 1.6s infinite}
+  .dot-idle{background:var(--muted)} .dot-block{background:var(--bad)} .dot-done{background:var(--good)}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,185,80,.5)}70%{box-shadow:0 0 0 6px rgba(63,185,80,0)}100%{box-shadow:0 0 0 0 rgba(63,185,80,0)}}
+
+  .badges{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}
+  .badge{font-size:10px;padding:2px 6px;border-radius:10px;background:#0b1020;border:1px solid #2a3350;color:var(--muted);display:inline-flex;align-items:center;gap:4px}
+  .badge.time{color:var(--cyan);border-color:#204152}
+  .badge.tok{color:#c9a3ff;border-color:#3a2a55}
+  .badge.retry{color:var(--warn);border-color:#4a3a12}
+  .badge.preempt{color:var(--bad);border-color:#4a1f22}
+  .badge.dep{color:#7fb0ff;border-color:#243a5a}
+  .badge.stage{color:var(--ink);border-color:#2a3350}
+
+  .meta-line{font-size:10.5px;color:var(--muted);margin-top:6px;display:flex;justify-content:space-between}
+  .progress{height:3px;background:#0b1020;border-radius:2px;margin-top:8px;overflow:hidden}
+  .progress .fill{height:100%;background:linear-gradient(90deg,var(--good),var(--cyan));width:40%}
+  .dep-strip{font-size:10px;color:#7fb0ff;margin-top:6px}
+
+  .hint{color:var(--muted);font-size:10.5px;margin-top:6px;line-height:1.5}
+</style>
+</head>
+<body>
+<div id="controls">
+  <h1>Clockwork Observability</h1>
+  <p class="sub">Decide the board + card look by seeing. Real clockwork palette + real data shapes (the prism-drift render chain). Toggle options, then copy the prompt for the implementation plan.</p>
+
+  <div class="presets" id="presets"></div>
+
+  <div class="group">
+    <h2>Global stats layout (the big choice)</h2>
+    <div class="seg" id="seg-layout">
+      <button data-v="header">Header bar</button>
+      <button data-v="panel">Dashboard panel</button>
+      <button data-v="modal">Light board + modal depth</button>
+    </div>
+    <div class="hint" id="layout-hint"></div>
+  </div>
+
+  <div class="group">
+    <h2>Interrupt (preemption) graph</h2>
+    <div class="row"><label>Show graph</label><input type="checkbox" id="showGraph" checked></div>
+    <div class="row"><label>Style</label>
+      <select id="graphStyle"><option value="spark">Sparkline bars</option><option value="area">Area line</option></select>
+    </div>
+    <div class="row"><label>Interrupt count (demo)</label><input type="range" id="interrupts" min="0" max="60" value="23"><span class="val" id="interruptsV"></span></div>
+  </div>
+
+  <div class="group">
+    <h2>Card content</h2>
+    <div class="row"><label>Live elapsed timer</label><input type="checkbox" id="cElapsed" checked></div>
+    <div class="row"><label>Token count</label><input type="checkbox" id="cTokens" checked></div>
+    <div class="row"><label>Dependency badges</label><input type="checkbox" id="cDeps" checked></div>
+    <div class="row"><label>Retry / preempt badges</label><input type="checkbox" id="cRetry" checked></div>
+    <div class="row"><label>Current stage badge</label><input type="checkbox" id="cStage" checked></div>
+    <div class="row"><label>Progress bar (running)</label><input type="checkbox" id="cProgress" checked></div>
+    <div class="row"><label>Status dot + color</label><input type="checkbox" id="cDot" checked></div>
+  </div>
+
+  <div class="group">
+    <h2>Look &amp; density</h2>
+    <div class="row"><label>Card padding</label><input type="range" id="pad" min="6" max="16" value="10"><span class="val" id="padV"></span></div>
+    <div class="row"><label>Corner radius</label><input type="range" id="radius" min="0" max="14" value="7"><span class="val" id="radiusV"></span></div>
+    <div class="row"><label>Badge fill</label><select id="badgeFill"><option value="outline">Outline (subtle)</option><option value="solid">Solid (bold)</option></select></div>
+    <div class="row"><label>Accent hue</label><input type="range" id="hue" min="0" max="360" value="345"><span class="val" id="hueV"></span></div>
+  </div>
+
+  <div class="group">
+    <h2>Motion</h2>
+    <div class="row"><label>Animate (tick timers, pulse)</label><input type="checkbox" id="animate" checked></div>
+  </div>
+</div>
+
+<div id="stage">
+  <div id="board-wrap"><div class="board-app" id="app"></div></div>
+  <div id="promptBox">
+    <div class="phead"><h3>Prompt for the implementation plan</h3><button id="copyBtn">Copy Prompt</button></div>
+    <p id="promptText" class="mono"></p>
+  </div>
+</div>
+
+<script>
+const DEFAULTS={layout:"header",showGraph:true,graphStyle:"spark",interrupts:23,cElapsed:true,cTokens:true,cDeps:true,cRetry:true,cStage:true,cProgress:true,cDot:true,pad:10,radius:7,badgeFill:"outline",hue:345,animate:true};
+const state={...DEFAULTS};
+
+const PRESETS={
+  "Recommended (rich cards + header)":{layout:"header",showGraph:true,graphStyle:"spark",cElapsed:true,cTokens:true,cDeps:true,cRetry:true,cStage:true,cProgress:true,cDot:true,pad:10,radius:7,badgeFill:"outline"},
+  "Dense / at-a-glance":{layout:"header",cProgress:false,pad:7,radius:5,badgeFill:"outline",graphStyle:"spark"},
+  "Dashboard panel + area graph":{layout:"panel",showGraph:true,graphStyle:"area",cProgress:true,pad:11,radius:8,badgeFill:"solid"},
+  "Minimal board + modal depth":{layout:"modal",cTokens:false,cDeps:false,cProgress:false,pad:8,radius:6,badgeFill:"outline"},
+};
+
+const LAYOUT_HINT={
+  header:"A persistent stats BAR across the top of the board: interrupt counter + graph + in-flight + tokens. One page, always visible.",
+  panel:"A dedicated collapsible dashboard PANEL for the deeper analytics; board cards stay focused. More surface, room for real charts.",
+  modal:"Board cards stay lighter; the CARD DETAIL MODAL holds the depth (per-stage timing, token log, preemption history). Small top strip for the global counter."
+};
+
+// ---- realistic data (the real prism-drift render chain + logic cards) ----
+const NOW=Date.now();
+const cards=[
+  {title:"Render: layout foundation + palette",col:"Implementation",status:"running",stage:"Implementation",started:NOW-38*60000,retry:0,preempt:5,tokens:184200,dep:null,blocks:"space backdrop"},
+  {title:"Render: space backdrop",col:"Impl-Planning",status:"idle",stage:"Impl-Planning",started:null,retry:0,preempt:0,tokens:12400,dep:"layout foundation",blocks:"themed modules"},
+  {title:"Render: themed modules + circuit legibility",col:"Impl-Planning",status:"idle",stage:"Impl-Planning",started:null,retry:0,preempt:0,tokens:0,dep:"space backdrop",blocks:"themed threats"},
+  {title:"Render: themed threats + active piece",col:"Impl-Planning",status:"idle",stage:null,started:null,retry:0,preempt:0,tokens:0,dep:"themed modules",blocks:"HUD"},
+  {title:"Render: HUD status bar + build tray",col:"Impl-Planning",status:"idle",stage:null,started:null,retry:0,preempt:0,tokens:0,dep:"themed threats",blocks:null},
+  {title:"Grid data model",col:"Done",status:"done",stage:"Done",started:NOW-9*3600000,retry:1,preempt:2,tokens:96300,dep:null,blocks:null},
+  {title:"Component types",col:"Done",status:"done",stage:"Done",started:NOW-8*3600000,retry:0,preempt:1,tokens:74100,dep:null,blocks:null},
+  {title:"Circuit connection check",col:"Done",status:"done",stage:"Done",started:NOW-8*3600000,retry:0,preempt:0,tokens:88900,dep:null,blocks:null},
+];
+const COLUMNS=["Backlog","Impl-Planning","Implementation","Code-Review","QA","Deploy","Done"];
+
+// preemption time-series (interrupts per 5-min bucket, last ~2h)
+function series(total){const n=24;const a=[];let left=total;for(let i=0;i<n;i++){const w=Math.max(0,Math.sin(i/2)*2+Math.random()*2);a.push(w)}const s=a.reduce((x,y)=>x+y,0)||1;return a.map(v=>Math.round(v/s*total))}
+
+// ---- helpers ----
+function hsl(h,s,l){return `hsl(${h} ${s}% ${l}%)`}
+function fmtDur(ms){if(ms==null)return"—";const s=Math.floor(ms/1000);if(s<60)return s+"s";const m=Math.floor(s/60);if(m<60)return m+"m "+(s%60)+"s";return Math.floor(m/60)+"h "+(m%60)+"m"}
+function fmtTok(n){if(!n)return"0";if(n>=1000)return (n/1000).toFixed(n>=100000?0:1)+"k";return ""+n}
+
+function badge(cls,txt){return `<span class="badge ${cls}">${txt}</span>`}
+
+function renderCard(c){
+  const accent=hsl(state.hue,70,60);
+  const running=c.status==="running";
+  const dotCls=c.status==="running"?"dot-run":c.status==="blocked"?"dot-block":c.status==="done"?"dot-done":"dot-idle";
+  const cls=["card",c.status].join(" ");
+  let badges=[];
+  if(state.cStage&&c.stage) badges.push(badge("stage",c.stage));
+  if(state.cElapsed&&running) badges.push(badge("time","⏱ "+fmtDur(NOW-c.started)));
+  if(state.cTokens&&c.tokens) badges.push(badge("tok","◈ "+fmtTok(c.tokens)+" tok"));
+  if(state.cRetry&&c.retry>0) badges.push(badge("retry","↻ "+c.retry+"/3"));
+  if(state.cRetry&&c.preempt>0) badges.push(badge("preempt","⚡ "+c.preempt));
+  if(state.cDeps&&c.dep) badges.push(badge("dep","⛓ needs "+c.dep.split(" ")[0]));
+
+  const dot=state.cDot?`<span class="status-dot ${dotCls}"></span>`:"";
+  const prog=(state.cProgress&&running)?`<div class="progress"><div class="fill" style="width:${40+Math.round((NOW-c.started)/38/60000*40)}%;background:linear-gradient(90deg,${accent},var(--cyan))"></div></div>`:"";
+  const depStrip=(state.cDeps&&c.blocks)?`<div class="dep-strip">↳ unblocks: ${c.blocks}</div>`:"";
+  return `<div class="${cls}" style="padding:${state.pad}px;border-radius:${state.radius}px;border-left-color:${running?'var(--good)':c.status==='blocked'?'var(--bad)':accent}">
+    <div class="title">${dot}${c.title}</div>
+    ${badges.length?`<div class="badges">${badges.join("")}</div>`:""}
+    ${prog}${depStrip}
+  </div>`;
+}
+
+function renderSpark(data){
+  const max=Math.max(...data,1);
+  return `<div class="spark">${data.map(v=>`<div class="b" style="height:${Math.max(2,v/max*30)}px;background:${hsl(state.hue,70,60)}"></div>`).join("")}</div>`;
+}
+function renderArea(data){
+  const max=Math.max(...data,1),w=100,h=40,step=w/(data.length-1);
+  const pts=data.map((v,i)=>`${(i*step).toFixed(1)},${(h-v/max*(h-4)-2).toFixed(1)}`).join(" ");
+  const fill=`0,${h} ${pts} ${w},${h}`;
+  return `<svg class="areagraph" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+    <polygon points="${fill}" fill="${hsl(state.hue,70,55)}" opacity="0.18"></polygon>
+    <polyline points="${pts}" fill="none" stroke="${hsl(state.hue,70,62)}" stroke-width="1.2"></polyline></svg>`;
+}
+
+function statsHeader(){
+  const inflight=cards.filter(c=>c.status==="running").length;
+  const totalTok=cards.reduce((s,c)=>s+c.tokens,0);
+  const data=series(state.interrupts);
+  const graph=state.showGraph?`<div class="graphwrap"><div class="glabel">arbiter interrupts · last 2h</div>${state.graphStyle==="spark"?renderSpark(data):renderArea(data)}</div>`:"";
+  return `<div class="stats">
+    <div class="stat"><span class="k">Interrupts</span><span class="v bad">${state.interrupts}</span></div>
+    <div class="stat"><span class="k">In-flight</span><span class="v good">${inflight}</span></div>
+    <div class="stat"><span class="k">Cards done</span><span class="v">${cards.filter(c=>c.status==="done").length}/8</span></div>
+    <div class="stat"><span class="k">Tokens</span><span class="v cyan">${fmtTok(totalTok)}</span></div>
+    ${graph}
+  </div>`;
+}
+
+function panel(){
+  const data=series(state.interrupts);
+  return `<div class="stats" style="flex-direction:column;align-items:stretch;gap:10px">
+    <div style="display:flex;gap:20px;">
+      <div class="stat"><span class="k">Arbiter interrupts</span><span class="v bad">${state.interrupts}</span></div>
+      <div class="stat"><span class="k">In-flight</span><span class="v good">${cards.filter(c=>c.status==="running").length}</span></div>
+      <div class="stat"><span class="k">Total tokens</span><span class="v cyan">${fmtTok(cards.reduce((s,c)=>s+c.tokens,0))}</span></div>
+      <div class="stat"><span class="k">Avg stage time</span><span class="v">7m</span></div>
+    </div>
+    ${state.showGraph?`<div class="graphwrap"><div class="glabel">interrupts over time (5-min buckets)</div>${state.graphStyle==="spark"?renderSpark(data):renderArea(data)}</div>`:""}
+    <div class="glabel" style="color:var(--muted)">▸ collapsible dashboard panel — deeper charts live here (token trends, per-stage timing distributions)</div>
+  </div>`;
+}
+
+function render(){
+  const app=document.getElementById("app");
+  let head="";
+  if(state.layout==="header") head=statsHeader();
+  else if(state.layout==="panel") head=panel();
+  else head=`<div class="stats" style="padding:8px 18px"><div class="stat"><span class="k">Interrupts</span><span class="v bad">${state.interrupts}</span></div><div class="stat"><span class="k">In-flight</span><span class="v good">${cards.filter(c=>c.status==='running').length}</span></div><div class="glabel" style="align-self:center;color:var(--muted)">· click a card for full timing / token / preemption detail →</div></div>`;
+
+  const colsHtml=COLUMNS.map(name=>{
+    const cc=cards.filter(c=>c.col===name);
+    return `<div class="column"><h2>${name}<span class="cnt">${cc.length}</span></h2>${cc.map(renderCard).join("")||'<div class="hint">—</div>'}</div>`;
+  }).join("");
+
+  app.innerHTML=`
+    <div class="topbar"><div class="brand">clockwork <small>prism-drift · M1 render</small></div><span class="conn">● connected</span></div>
+    ${head}
+    <div class="cols">${colsHtml}</div>`;
+}
+
+// ---- controls ----
+function seg(id,key){const el=document.getElementById(id);el.querySelectorAll("button").forEach(b=>{b.onclick=()=>{state[key]=b.dataset.v;el.querySelectorAll("button").forEach(x=>x.classList.remove("on"));b.classList.add("on");if(key==="layout")document.getElementById("layout-hint").textContent=LAYOUT_HINT[b.dataset.v];updateAll()}});const cur=el.querySelector(`[data-v="${state[key]}"]`);if(cur)cur.classList.add("on")}
+function bind(id,key,isCheck){const el=document.getElementById(id);const set=()=>{state[key]=isCheck?el.checked:(el.type==="range"?+el.value:el.value);const v=document.getElementById(id+"V");if(v)v.textContent=el.value;updateAll()};el.addEventListener("input",set);set()}
+
+seg("seg-layout","layout");
+document.getElementById("layout-hint").textContent=LAYOUT_HINT[state.layout];
+["interrupts","pad","radius","hue"].forEach(id=>bind(id,id,false));
+["showGraph","cElapsed","cTokens","cDeps","cRetry","cStage","cProgress","cDot","animate"].forEach(id=>bind(id,id,true));
+bind("graphStyle","graphStyle",false);bind("badgeFill","badgeFill",false);
+
+const pc=document.getElementById("presets");
+Object.keys(PRESETS).forEach(name=>{const b=document.createElement("button");b.textContent=name;b.onclick=()=>{Object.assign(state,PRESETS[name]);syncControls();updateAll()};pc.appendChild(b)});
+function syncControls(){
+  for(const k in state){const el=document.getElementById(k);if(!el)continue;if(el.type==="checkbox")el.checked=state[k];else el.value=state[k];const v=document.getElementById(k+"V");if(v)v.textContent=el.value}
+  document.querySelectorAll("#seg-layout button").forEach(b=>b.classList.toggle("on",b.dataset.v===state.layout));
+  document.getElementById("layout-hint").textContent=LAYOUT_HINT[state.layout];
+}
+
+function q(b){return b?"yes":"no"}
+function updatePrompt(){
+  const L={header:"a persistent stats HEADER BAR across the top of the board",panel:"a collapsible DASHBOARD PANEL for deeper analytics",modal:"a light board with the DEPTH in the card-detail MODAL, plus a small global stats strip"}[state.layout];
+  const lines=[];
+  lines.push("CLOCKWORK OBSERVABILITY — board + card redesign (public/index.html + supporting API/data).");
+  lines.push("");
+  lines.push("Global stats layout: "+L+".");
+  lines.push("Interrupt graph: "+(state.showGraph?`show a ${state.graphStyle==="spark"?"sparkline-bar":"area-line"} graph of arbiter preemptions over time, next to an interrupt COUNTER`:"no graph, counter only")+".");
+  lines.push("Card content — show on each card: "+
+    [state.cDot?"status dot (color by state: running/idle/blocked/done)":null,
+     state.cStage?"current stage":null,
+     state.cElapsed?"LIVE elapsed/processing time (ticking when running)":null,
+     state.cTokens?"token count":null,
+     state.cRetry?"retry count (n/3) and arbiter-preemption count":null,
+     state.cDeps?"dependency badges (needs-X, and unblocks-Y)":null,
+     state.cProgress?"a progress bar while running":null].filter(Boolean).join("; ")+".");
+  lines.push("Look: card padding "+state.pad+"px, corner radius "+state.radius+"px, "+state.badgeFill+" badges, accent hue "+state.hue+" (keep clockwork's dark navy base "+
+    "#1a1a2e/#16213e/#0f3460).");
+  lines.push(state.animate?"Animate: live-ticking timers + a subtle pulse on the running status dot.":"No animation.");
+  lines.push("");
+  lines.push("Data work implied: persist arbiter preemptions as timestamped events (for the counter + time-series graph); capture per-attempt token usage (verify pi --mode json / model-server usage block first); surface elapsed from attempt startedAt/completedAt; surface dependsOn (needs) + reverse-deps (unblocks). Keep the single-file vanilla HTML/CSS/JS + WebSocket approach; no framework.");
+  document.getElementById("promptText").textContent=lines.join("\n");
+}
+
+function updateAll(){render();updatePrompt()}
+document.getElementById("copyBtn").onclick=()=>{navigator.clipboard.writeText(document.getElementById("promptText").textContent).then(()=>{const b=document.getElementById("copyBtn");const o=b.textContent;b.textContent="Copied!";setTimeout(()=>b.textContent=o,1200)})};
+
+updateAll();
+// live tick for elapsed timers + progress
+setInterval(()=>{if(state.animate&&(state.cElapsed||state.cProgress)){render()}},1000);
+</script>
+</body>
+</html>

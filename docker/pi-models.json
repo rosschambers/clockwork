@@ -1,0 +1,38 @@
+{
+	"providers": {
+		"frame-dense-low": {
+			"baseUrl": "http://your-model-host:8185/v1",
+			"api": "openai-completions",
+			"apiKey": "frame",
+			"compat": { "supportsDeveloperRole": false, "thinkingFormat": "qwen-chat-template" },
+			"models": [
+				{
+					"id": "local-dense-27b.gguf",
+					"name": "Frame Dense 27B [LOW/preemptible]",
+					"reasoning": true,
+					"input": ["text", "image"],
+					"contextWindow": 262144,
+					"maxTokens": 32768,
+					"cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+				}
+			]
+		},
+		"frame-agentic-low": {
+			"baseUrl": "http://your-model-host:8181/v1",
+			"api": "openai-completions",
+			"apiKey": "frame",
+			"compat": { "supportsDeveloperRole": false, "thinkingFormat": "qwen-chat-template" },
+			"models": [
+				{
+					"id": "local-moe-35b.gguf",
+					"name": "Frame Agentic 35B-A3B MoE [LOW/preemptible]",
+					"reasoning": true,
+					"input": ["text", "image"],
+					"contextWindow": 262144,
+					"maxTokens": 32768,
+					"cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+				}
+			]
+		}
+	}
+}

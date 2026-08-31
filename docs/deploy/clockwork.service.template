@@ -1,0 +1,89 @@
+# clockwork — systemd user-service template
+#
+# Copy to ~/.config/systemd/user/clockwork.service on the studio host, fill the
+# <placeholders>, then:  systemctl --user daemon-reload && systemctl --user enable --now clockwork
+#
+# Every Environment= line below is a CLOCKWORK_* variable the code ACTUALLY reads
+# (verified against src/ + scripts/ with:  rg -o "CLOCKWORK_[A-Z_]+" src/ scripts/ | sort -u).
+# Secrets (tokens) are NOT written here in plaintext — they come from SOPS via the
+# EnvironmentFile below. See docs/deploy/README.md for the full mapping and run order.
+
+[Unit]
+Description=clockwork kanban-state-machine build platform
+Documentation=https://github.com/rosschambers/clockwork docs/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Working directory is the checked-out clockwork repo.
+WorkingDirectory=%h/code/agent-systems/clockwork
+# Entrypoint: package.json "start" == bun run src/index.ts (see package.json:5).
+ExecStart=/run/current-system/sw/bin/bun run src/index.ts
+Restart=on-failure
+RestartSec=5
+
+# --- Secrets: decrypted by SOPS to a tmpfs file, referenced (not committed plaintext) ---
+# This file must define CLOCKWORK_TOKEN, CLOCKWORK_GIT_TOKEN, CLOCKWORK_NOTIFY_TOKEN,
+# and CLOCKWORK_SMS_TOKEN. `-` prefix = do not fail to start if absent (e.g. no-auth dev).
+EnvironmentFile=-%h/.clockwork-data/secrets.env
+
+# =====================================================================
+# Service configuration — read at startup by src/index.ts
+# =====================================================================
+
+# --- Storage / paths (src/index.ts:9-11) ---
+# SQLite DB file. Default ":memory:" (ephemeral) — MUST be a real path in production
+# so the board survives a redeploy. Additive migrations only.
+Environment=CLOCKWORK_DB_PATH=%h/.clockwork-data/clockwork.db
+# Root under which per-project origin clones live. The production origin at
+# $CLOCKWORK_REPOS/<project> is a BARE repo, created by scripts/ensure-bare-origin.ts
+# (Task 2) — never a hand `git config`. Default "./repos". Studio: %h/.clockwork-data/repos
+Environment=CLOCKWORK_REPOS=%h/.clockwork-data/repos
+# Where pi transcripts are written. Default "./transcripts".
+Environment=CLOCKWORK_TRANSCRIPTS=%h/.clockwork-data/transcripts
+
+# --- Server (src/index.ts:12) ---
+# HTTP/websocket port for the board + director API. Default 3000. Tailnet-only bind.
+Environment=CLOCKWORK_PORT=3000
+
+# --- Worker (src/index.ts:13, 62-71; src/worker.ts:122) ---
+# The project id whose board the single worker loop drives. If unset, the server runs
+# with NO worker (board only). No default — set it in production.
+Environment=CLOCKWORK_WORKER_PROJECT_ID=<placeholder-project-id>
+# Kickback retry counter before a card parks at needs-human. Default 3.
+Environment=CLOCKWORK_MAX_RETRIES=3
+# Worker poll interval in milliseconds. Default 5000.
+Environment=CLOCKWORK_POLL_INTERVAL_MS=5000
+# pi inactivity watchdog in milliseconds — a pi session is killed only after this long
+# with NO output (resets on every chunk). Default 600000 (10 min).
+Environment=CLOCKWORK_PI_INACTIVITY_MS=600000
+# pi total-runtime backstop in milliseconds — absolute ceiling on one pi session
+# regardless of activity. Default 3600000 (60 min).
+Environment=CLOCKWORK_PI_MAX_RUNTIME_MS=3600000
+# Frame-arbiter preemption backoff in milliseconds. No default (undefined = worker built-in).
+Environment=CLOCKWORK_PREEMPTION_BACKOFF_MS=<placeholder-ms>
+# Max retries after arbiter preemption. No default (undefined = worker built-in).
+Environment=CLOCKWORK_MAX_PREEMPTION_RETRIES=<placeholder-count>
+
+# --- Notifications / milestones (src/index.ts:45-46, 64-69; src/api.ts:750-756) ---
+# Milestone label used to tag milestone cards. No default.
+Environment=CLOCKWORK_MILESTONE_LABEL=<placeholder-label>
+# Shell command run to copy a build artifact out on milestone. No default.
+Environment=CLOCKWORK_BUILD_COPY_COMMAND=<placeholder-command>
+# Generic notify webhook URL (non-secret). No default.
+Environment=CLOCKWORK_NOTIFY_URL=<placeholder-notify-url>
+# SMS webhook URL (non-secret). No default.
+Environment=CLOCKWORK_SMS_URL=<placeholder-sms-url>
+
+# =====================================================================
+# SECRETS — do NOT set here. Provided by EnvironmentFile (SOPS-decrypted) above.
+# Listed for documentation only:
+#   CLOCKWORK_TOKEN         API auth token (src/index.ts:14, src/api.ts:745). null = no auth.
+#   CLOCKWORK_GIT_TOKEN     git push/pull credential (src/index.ts:35,47; src/api.ts:756).
+#   CLOCKWORK_NOTIFY_TOKEN  auth for the notify webhook (src/index.ts:46,65; src/api.ts:753).
+#   CLOCKWORK_SMS_TOKEN     auth for the SMS webhook (src/index.ts:67).
+# =====================================================================
+
+[Install]
+WantedBy=default.target
