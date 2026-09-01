@@ -66,15 +66,40 @@ upkeep" in `AGENTS.md`).
     idle (`/proc/<bunpid>/task/*/children` empty — see "Diagnosing a stuck card" in
     AGENTS.md); a restart kills any live session.
 
-## Phase 4 — Verification harness (per-tenant, NOT clockwork core)
+## Phase 4 — Verification harness + Visual-Check column (per-tenant)
 
-9. Build the tenant's visual/functional QA skill inside the tenant repo. The prism-drift
-   pattern: a pi skill (`tools/visual-qa-skill/SKILL.md`) that renders the real artifact and
-   gets a vision-model verdict, with per-card scenario files
-   (`scenarios/<CLOCKWORK_CARD_ID>.yaml`, falling back to `scenarios/main.yaml`). Web
-   equivalent: Playwright (or similar) screenshots of the running page fed to the same vision
-   verdict — same scenario-file convention. This visual feedback loop is a large part of why
-   prism-drift worked; do not skip it for user-facing cards.
+11. Build the tenant's visual/functional QA skill inside the tenant repo. The prism-drift
+    pattern: a pi skill (`tools/visual-qa-skill/SKILL.md`) that renders the real artifact and
+    gets a vision-model verdict, with per-card scenario files
+    (`scenarios/<CLOCKWORK_CARD_ID>.yaml`, falling back to `scenarios/main.yaml`). Web
+    equivalent: Playwright (or similar) screenshots of the running page fed to the same vision
+    verdict — same scenario-file convention.
+12. **Add a Visual-Check column** — a dedicated read-only visual subagent between Code-Review
+    and QA. Its sole job: run the harness, compare screenshots to the scenario, emit pass/fail
+    with specific actionable feedback. It must NOT edit code. Non-visual cards (no scenario
+    file) pass through immediately. Create it via `POST /api/projects/:id/columns` with
+    `position` between Code-Review and QA, the tenant's QA skill attached, and a prompt that
+    bans file modification and enforces a single-pass harness run.
+
+    **Column ordering rule (learned from project-bastion, 2026-09-01): read-only columns must
+    sit AFTER code-editing columns in the pipeline.** Kickback moves a card one column
+    backward. If a read-only column (Visual-Check) sits between a code-editing column
+    (Implementation) and a finding column (Code-Review), then Code-Review's kickback lands at
+    Visual-Check — which cannot fix the code — and the card bounces in a dead zone until
+    retries exhaust. The correct order is:
+
+    `Implementation → Code-Review → Visual-Check → QA → Deploy → Done`
+
+    Code-Review kicks back to Implementation (can fix); Visual-Check kicks back to Code-Review
+    (which then kicks to Implementation if the issue is code). Every kickback eventually
+    reaches a column that can act on the finding.
+
+13. **Ban visual rendering from Implementation.** Add to the Implementation column prompt:
+    "do NOT launch the game, take screenshots, or run the visual QA harness. Visual
+    correctness is verified by the Visual-Check column." Without this ban, Implementation
+    sessions spiral in a render-screenshot-tweak loop (1,000+ tool calls, 2-hour watchdog
+    kill, zero verdict) — the defining failure mode for visual cards on the local model
+    (project-bastion M1-08 and M1-20, 2026-08-30/31).
 
 ## Phase 5 — Card authoring (the highest-leverage step)
 
