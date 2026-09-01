@@ -67,35 +67,51 @@ export function isPreemption(result: PiResult): boolean {
 // the stdout event stream contains `auto_retry_end` with `success: false` and/or
 // `agent_end` events with `stopReason: "error"`. These are NOT card failures and
 // must not consume retries.
-const INFRA_ERROR_PATTERNS = [
-	/request timed out/i,
-	/preempted by higher-priority request/i,
-	/503/,
-	/connection refused/i,
-	/ECONNREFUSED/,
-	/ECONNRESET/,
+const INFRA_ERROR_PATTERNS: Array<[RegExp, string]> = [
+	[/request timed out/i, "request timeout"],
+	[/preempted by higher-priority request/i, "arbiter preemption (inside pi)"],
+	[/503/, "503 service unavailable"],
+	[/connection refused/i, "connection refused"],
+	[/ECONNREFUSED/, "ECONNREFUSED"],
+	[/ECONNRESET/, "ECONNRESET"],
 ]
 
-export function isInfrastructureFailure(result: PiResult): boolean {
+// Returns a classified reason string if the failure is infrastructure, or null if
+// it is a genuine card failure. The reason distinguishes preemption-inside-pi from
+// connection errors so the log message is diagnostic, not a misleading catch-all
+// (project-bastion 2026-09-01: "timeouts/preemptions" label was wrong — the arbiter
+// had zero events; the real cause was a transient connection error).
+export function classifyInfrastructureFailure(result: PiResult): string | null {
+	// Helper: find which pattern matched a string and return a human label.
+	function matchedLabel(text: string): string | null {
+		for (const [pattern, label] of INFRA_ERROR_PATTERNS) {
+			if (pattern.test(text)) return label
+		}
+		return null
+	}
+
 	// A watchdog-timeout (exit 124) can WRAP a preemption storm: clockwork's own
 	// inactivity/max-runtime watchdog kills the session (exit 124) while the
 	// preemption evidence sits in STDOUT (the pi event stream) and only the watchdog
 	// message is in stderr — so isPreemption (stderr-only) misses it. Scan stdout for
 	// unambiguous infra markers so a preemption-driven timeout is NOT charged as a
 	// card retry. A 124 with no such markers is a genuine hang/loop (a real card
-	// failure) and correctly falls through to `false`. (prism-drift M2-15: preemption
+	// failure) and correctly falls through to `null`. (prism-drift M2-15: preemption
 	// storms exhausted all 3 retries and parked correct, tested, visually-QA-green work.)
 	if (result.exitCode === 124) {
-		return INFRA_ERROR_PATTERNS.some((p) => p.test(result.stdout))
+		for (const [pattern, label] of INFRA_ERROR_PATTERNS) {
+			if (pattern.test(result.stdout)) return `watchdog kill wrapping ${label}`
+		}
+		return null
 	}
 	// Any other non-zero exit is caught by isPreemption (a clean arbiter preemption).
 	if (result.exitCode !== 0) {
-		return false
+		return null
 	}
 	// Look for auto_retry_end with success: false — unambiguous pi-level retry exhaustion.
 	const retryEndMatch = result.stdout.match(/"type"\s*:\s*"auto_retry_end"[^}]*"success"\s*:\s*false/)
 	if (retryEndMatch) {
-		return true
+		return "pi auto-retry exhausted"
 	}
 	// Look for a final agent_end with stopReason: "error" and an infra error message.
 	const agentEndPattern = /"type"\s*:\s*"agent_end"[^}]*"stopReason"\s*:\s*"error"[^}]*"errorMessage"\s*:\s*"([^"]*)"/g
@@ -104,10 +120,16 @@ export function isInfrastructureFailure(result: PiResult): boolean {
 	while ((match = agentEndPattern.exec(result.stdout)) !== null) {
 		lastErrorMessage = match[1] ?? ""
 	}
-	if (lastErrorMessage && INFRA_ERROR_PATTERNS.some((p) => p.test(lastErrorMessage))) {
-		return true
+	if (lastErrorMessage) {
+		const label = matchedLabel(lastErrorMessage)
+		if (label) return label
 	}
-	return false
+	return null
+}
+
+// Backwards-compatible boolean wrapper for test fakes that only need the gate.
+export function isInfrastructureFailure(result: PiResult): boolean {
+	return classifyInfrastructureFailure(result) !== null
 }
 
 export type InvokePiFn = (invocation: PiInvocation) => Promise<PiResult>
@@ -793,12 +815,16 @@ export class Worker {
 		}
 
 		// Infrastructure failure inside pi's own auto-retry: the process exited
-		// cleanly (code 0) but the session was killed by timeouts or preemptions
-		// that pi retried internally. This is NOT a card failure — leave the card
-		// unchanged (no attempt, no retry consumed) just like a direct preemption.
-		if (isInfrastructureFailure(result)) {
+		// cleanly (code 0) but the session was killed by timeouts or connection
+		// errors that pi retried internally. This is NOT a card failure — leave the
+		// card unchanged (no attempt, no retry consumed) just like a direct
+		// preemption. The classified reason distinguishes the specific cause so the
+		// log is diagnostic (not a misleading "preemption" when the arbiter had zero
+		// events — project-bastion 2026-09-01).
+		const infraReason = classifyInfrastructureFailure(result)
+		if (infraReason) {
 			this.dbStore.unclaimCard(card.id)
-			emitEvent(this.onEvent, { type: "blocked", cardId: card.id, reason: "pi session failed due to infrastructure errors (timeouts/preemptions inside pi auto-retry); leaving card unchanged for a later attempt" })
+			emitEvent(this.onEvent, { type: "blocked", cardId: card.id, reason: `pi session failed: ${infraReason}; leaving card unchanged for a later attempt` })
 			return
 		}
 
