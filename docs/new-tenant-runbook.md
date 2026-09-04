@@ -101,6 +101,35 @@ upkeep" in `AGENTS.md`).
     kill, zero verdict) — the defining failure mode for visual cards on the local model
     (project-bastion M1-08 and M1-20, 2026-08-30/31).
 
+14. **(Optional) Add a Test-Writing column** — the TDD red phase, between Impl-Planning
+    (position 200) and Implementation (position 300), at position 250 (first added on
+    project-bastion). Create it via `POST /api/projects/:id/columns`. Its prompt duties: read
+    the card plus the Impl-Planning plan file, then commit FAILING tests plus minimal stubs
+    (class_name + signatures) so the project imports cleanly and the new tests fail for the
+    right reason (missing behavior, never parse errors). Pre-existing tests must stay green.
+    View-only visual cards pass through with "view-only card, no unit tests to add".
+
+    Implementation then starts from the committed failing tests — they ARE the executable
+    acceptance criteria, and the Implementation prompt must forbid rewriting them to fit its
+    code (a genuine test-vs-plan contradiction kicks back to Test-Writing instead). The
+    rationale: Implementation was the whale column where all stalls happened (read-loops,
+    render-spirals); splitting the red phase out reduces per-session context and scope, and
+    generalizes the skeleton-then-fill lesson structurally — every Implementation session
+    starts from committed work.
+
+    The kickback chain stays sound under the column-ordering rule above: Implementation kicks
+    back to Test-Writing (which CAN edit tests), and Test-Writing kicks back to Impl-Planning.
+    Every kickback still reaches a column that can act on the finding.
+
+    The deliverable gate is unaffected: it keys off the column named "Implementation" by
+    position and diffs the whole branch, so tests committed by Test-Writing count toward
+    target satisfaction — acceptable because Implementation's prompt requires the full suite
+    green to pass.
+
+    Pair this with an Implementation prompt that reads the card's plan file
+    (`docs/plans/card-*-plan.md`) FIRST as primary context, consulting the full contract docs
+    only where the plan is silent.
+
 ## Phase 5 — Card authoring (the highest-leverage step)
 
 10. The director translates plan tasks into cards. **Follow the clockwork-card-authoring
