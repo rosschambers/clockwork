@@ -132,6 +132,36 @@ export function isInfrastructureFailure(result: PiResult): boolean {
 	return classifyInfrastructureFailure(result) !== null
 }
 
+// A session killed by clockwork's own watchdog (exit 124, no infra markers) never
+// emitted a verdict, and its final assistant text is empty or mid-stream. Handing
+// that empty reply to the model-based extraction fallback produced hallucinated
+// "the transcript is empty" verdicts that burned stage retries with zero useful
+// feedback (project-bastion M2-03a, 2026-09-06: five such retries while 8 MB
+// transcripts of real work sat on disk). The timeout verdict must be synthesized
+// deterministically: an honest fail that names the watchdog and tells the next
+// attempt to resume from the committed WIP instead of restarting.
+const WATCHDOG_KILL_PATTERN = /\[clockwork: pi killed after (\d+)ms (inactivity|max-runtime) watchdog\]/
+
+export function synthesizeWatchdogVerdict(result: PiResult): Verdict | null {
+	if (result.exitCode !== 124) {
+		return null
+	}
+	const match = result.stderr.match(WATCHDOG_KILL_PATTERN)
+	if (!match) {
+		return null
+	}
+	const minutes = Math.round(Number(match[1]) / 60000)
+	const kind = match[2]
+	return {
+		verdict: "fail",
+		feedback:
+			`Session killed by the ${minutes}-minute ${kind} watchdog before emitting a verdict. ` +
+			`Any partial work was committed to the card branch — resume from that committed state instead of restarting, ` +
+			`work in small verifiable steps, and emit the verdict JSON as soon as the acceptance criteria are met (or clearly cannot be met) rather than continuing to iterate.`,
+		artifacts: [],
+	}
+}
+
 export type InvokePiFn = (invocation: PiInvocation) => Promise<PiResult>
 
 // The subset of RepoWorkspace the worker needs. Injected (not imported directly)
@@ -831,7 +861,12 @@ export class Worker {
 		// pi runs in --mode json, so stdout is a stream of per-line event objects.
 		// Reconstruct the model's final reply text before parsing the verdict.
 		const replyText = extractAssistantText(result.stdout)
-		let verdict = parseVerdict(replyText)
+		// A watchdog kill (exit 124 that classifyInfrastructureFailure did NOT claim)
+		// has no final reply to parse or extract — synthesize the honest fail verdict
+		// deterministically. Never hand the empty reply to the extraction fallback:
+		// the extractor model can only hallucinate about an empty transcript.
+		const watchdogVerdict = synthesizeWatchdogVerdict(result)
+		let verdict = watchdogVerdict ?? parseVerdict(replyText)
 
 		// C4 — grammar-constrained verdict extraction fallback. If the verdict is
 		// blocked ONLY because the output had no parseable verdict (the model did the
@@ -839,7 +874,7 @@ export class Worker {
 		// SECOND, tightly-constrained call that asks the model to read its own
 		// transcript and emit ONLY the verdict JSON. A model-declared block is left
 		// alone (nothing to rescue).
-		if (isParseFailureVerdict(verdict)) {
+		if (watchdogVerdict === null && isParseFailureVerdict(verdict)) {
 			try {
 				const extraction = await invokeFn({
 					prompt: EXTRACTION_PROMPT + "\n\n<transcript>\n" + replyText.slice(-6000) + "\n</transcript>",

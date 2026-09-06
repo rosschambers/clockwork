@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test"
-import { Worker, type WorkerConfig, type WorkerEvent, type PiResult, isInfrastructureFailure } from "./worker.ts"
+import { Worker, type WorkerConfig, type WorkerEvent, type PiResult, isInfrastructureFailure, synthesizeWatchdogVerdict } from "./worker.ts"
 import { DbStore, type DbColumn } from "./db.ts"
 import { parseVerdict, extractAssistantText } from "./verdict.ts"
 import { randomUUID } from "node:crypto"
@@ -2093,5 +2093,107 @@ describe("isInfrastructureFailure", () => {
 			exitCode: 124,
 		}
 		expect(isInfrastructureFailure(result)).toBe(false)
+	})
+})
+
+describe("synthesizeWatchdogVerdict", () => {
+	// A watchdog kill (exit 124, no infra markers) has NO final assistant text —
+	// handing the empty reply to the extraction fallback produced a hallucinated
+	// "the transcript is empty" verdict (project-bastion M2-03a burned stage
+	// retries on exactly that, 2026-09-06). The verdict for a timeout must be
+	// synthesized deterministically, never extracted by a model.
+	it("synthesizes a fail verdict for a max-runtime watchdog kill", () => {
+		const result: PiResult = {
+			stdout: '{"type":"tool_call","name":"bash","arguments":{"command":"godot --headless"}}',
+			stderr: "\n[clockwork: pi killed after 7200000ms max-runtime watchdog]",
+			exitCode: 124,
+		}
+		const verdict = synthesizeWatchdogVerdict(result)
+		expect(verdict).not.toBeNull()
+		expect(verdict!.verdict).toBe("fail")
+		expect(verdict!.feedback).toContain("120-minute max-runtime")
+		expect(verdict!.artifacts).toEqual([])
+	})
+
+	it("synthesizes a fail verdict for an inactivity watchdog kill", () => {
+		const result: PiResult = {
+			stdout: "",
+			stderr: "\n[clockwork: pi killed after 900000ms inactivity watchdog]",
+			exitCode: 124,
+		}
+		const verdict = synthesizeWatchdogVerdict(result)
+		expect(verdict).not.toBeNull()
+		expect(verdict!.verdict).toBe("fail")
+		expect(verdict!.feedback).toContain("15-minute inactivity")
+	})
+
+	it("returns null for a non-124 exit", () => {
+		const result: PiResult = {
+			stdout: "",
+			stderr: "some other failure",
+			exitCode: 1,
+		}
+		expect(synthesizeWatchdogVerdict(result)).toBeNull()
+	})
+
+	it("returns null for a 124 without the clockwork watchdog marker", () => {
+		const result: PiResult = {
+			stdout: "",
+			stderr: "killed by something else",
+			exitCode: 124,
+		}
+		expect(synthesizeWatchdogVerdict(result)).toBeNull()
+	})
+})
+
+describe("Worker — watchdog kill yields a deterministic verdict", () => {
+	it("records a fail verdict naming the watchdog and never calls the extraction fallback", async () => {
+		const { store, path } = createTempDb()
+		const seeded = seedTestData(store)
+
+		const events: WorkerEvent[] = []
+		const worker = new Worker({
+			dbStore: store,
+			projectId: seeded.projectId,
+			token: "test",
+			workerId: "test-worker",
+			projectRoot: "/tmp",
+			transcriptsDir: `/tmp/clockwork-transcripts-${randomUUID()}`,
+			pollIntervalMs: 50,
+			maxRetries: 3,
+			onEvent: (e) => events.push(e),
+		})
+		// A session killed by the max-runtime watchdog mid-tool-grind: exit 124,
+		// stdout holds mid-stream events with no final assistant text.
+		let invocationCount = 0
+		worker.invokePi = mock(() => {
+			invocationCount += 1
+			return Promise.resolve({
+				stdout: '{"type":"tool_call","name":"bash","arguments":{"command":"godot --headless"}}',
+				stderr: "\n[clockwork: pi killed after 7200000ms max-runtime watchdog]",
+				exitCode: 124,
+			})
+		})
+
+		const claimed = await worker["claimCard"]()
+		await worker.processCard(claimed!)
+
+		// Exactly ONE pi call: the work session. No model-based extraction fallback
+		// (it can only hallucinate about an empty reply).
+		expect(invocationCount).toBe(1)
+
+		// The recorded verdict is a deterministic fail naming the watchdog, and it
+		// flows through the normal kickback path (consumes a retry).
+		const failed = events.find((e) => e.type === "failed")
+		expect(failed).toBeDefined()
+		expect((failed as { feedback: string }).feedback).toContain("max-runtime")
+		const thread = store.getCardThreads(seeded.cardId)
+		const verdictEntry = thread.find((t) => t.entryType === "verdict")
+		expect(verdictEntry).toBeDefined()
+		expect(verdictEntry!.content).toContain("fail")
+		expect(verdictEntry!.content).toContain("max-runtime")
+
+		store.close()
+		fs.unlinkSync(path)
 	})
 })
