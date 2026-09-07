@@ -103,6 +103,25 @@ that card from finishing. The restarts, not the card, were the problem.
 Then investigate read-only and surface it — **never auto-restart the service to "unwedge" it.**
 Restarting throws away a possibly-live session and its uncommitted work.
 
+**Verdict classification history — two lying-telemetry bugs, both fixed 2026-09-07 (read
+before "improving" the classifiers again):**
+
+- **"The transcript is empty" verdicts were hallucinations, not facts.** A watchdog-killed
+  session (exit 124) has no final assistant text; the C4 extraction fallback got an empty
+  `<transcript>` and reported it empty while 8 MB of real work sat on disk — each one burned a
+  stage retry with zero feedback. Fixed in `010b732`: `synthesizeWatchdogVerdict` builds the
+  timeout verdict deterministically; the extractor is never consulted for exit-124. If you see
+  "transcript is empty" in a verdict on current code, something regressed.
+- **Bare substring infra patterns over session content are poison.** `/503/` matched epoch
+  timestamps, token counts, and game tick numbers anywhere in the 8 MB stream, classifying six
+  real 75-minute work sessions in one night as infra — and the infra path then DROPPED the work
+  (it returned before commitCardWork/saveTranscript), with no retries charged so nothing
+  surfaced on the board. Fixed in `c5d04d0`: exit-124 infra classification requires terminal
+  structured evidence (failed `auto_retry_end`, `agent_end` errorMessage, or a distinctive
+  multi-word phrase — see `RAW_SCAN_SAFE_PATTERNS`), and the infra path now saves the
+  transcript and commits WIP before releasing the card. Any new infra pattern must be either
+  a multi-word phrase or confined to errorMessage context — never a bare number or short token.
+
 ## Authoring cards — targets and dependencies
 
 ### Declare `targets` explicitly for cards that produce code
