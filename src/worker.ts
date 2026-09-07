@@ -76,6 +76,32 @@ const INFRA_ERROR_PATTERNS: Array<[RegExp, string]> = [
 	[/ECONNRESET/, "ECONNRESET"],
 ]
 
+// The subset of patterns safe to scan against RAW session content (the full event
+// stream). Only distinctive multi-word phrases and error constants qualify. The
+// bare /503/ is deliberately EXCLUDED: matched against 8 MB of session content it
+// hits epoch timestamps, token counts, and game data — six project-bastion
+// sessions (~7.5 hours of real work) were dropped in one night because "503"
+// appeared as a plain number in their streams (2026-09-07). /503/ may only match
+// inside a terminal errorMessage, where it is unambiguous.
+const RAW_SCAN_SAFE_PATTERNS: Array<[RegExp, string]> = [
+	[/request timed out/i, "request timeout"],
+	[/preempted by higher-priority request/i, "arbiter preemption (inside pi)"],
+	[/connection refused/i, "connection refused"],
+	[/ECONNREFUSED/, "ECONNREFUSED"],
+	[/ECONNRESET/, "ECONNRESET"],
+]
+
+// Extract the LAST agent_end errorMessage from the event stream, or "" if none.
+function lastAgentEndErrorMessage(stdout: string): string {
+	const agentEndPattern = /"type"\s*:\s*"agent_end"[^}]*"stopReason"\s*:\s*"error"[^}]*"errorMessage"\s*:\s*"([^"]*)"/g
+	let match: RegExpExecArray | null = null
+	let lastErrorMessage = ""
+	while ((match = agentEndPattern.exec(stdout)) !== null) {
+		lastErrorMessage = match[1] ?? ""
+	}
+	return lastErrorMessage
+}
+
 // Returns a classified reason string if the failure is infrastructure, or null if
 // it is a genuine card failure. The reason distinguishes preemption-inside-pi from
 // connection errors so the log message is diagnostic, not a misleading catch-all
@@ -93,13 +119,23 @@ export function classifyInfrastructureFailure(result: PiResult): string | null {
 	// A watchdog-timeout (exit 124) can WRAP a preemption storm: clockwork's own
 	// inactivity/max-runtime watchdog kills the session (exit 124) while the
 	// preemption evidence sits in STDOUT (the pi event stream) and only the watchdog
-	// message is in stderr — so isPreemption (stderr-only) misses it. Scan stdout for
-	// unambiguous infra markers so a preemption-driven timeout is NOT charged as a
-	// card retry. A 124 with no such markers is a genuine hang/loop (a real card
-	// failure) and correctly falls through to `null`. (prism-drift M2-15: preemption
-	// storms exhausted all 3 retries and parked correct, tested, visually-QA-green work.)
+	// message is in stderr — so isPreemption (stderr-only) misses it. But the
+	// evidence must be TERMINAL and STRUCTURED: a failed auto_retry_end, an
+	// agent_end errorMessage, or a distinctive multi-word phrase. Never a bare
+	// substring over content — /503/ over 8 MB of session data matched timestamps
+	// and game numbers, silently dropping six real work sessions in one night
+	// (project-bastion M2-03a, 2026-09-07). A 124 with no such evidence is a
+	// genuine hang/loop (a real card failure) and correctly falls through to `null`.
 	if (result.exitCode === 124) {
-		for (const [pattern, label] of INFRA_ERROR_PATTERNS) {
+		if (/"type"\s*:\s*"auto_retry_end"[^}]*"success"\s*:\s*false/.test(result.stdout)) {
+			return "watchdog kill wrapping pi auto-retry exhausted"
+		}
+		const errorMessage = lastAgentEndErrorMessage(result.stdout)
+		if (errorMessage) {
+			const label = matchedLabel(errorMessage)
+			if (label) return `watchdog kill wrapping ${label}`
+		}
+		for (const [pattern, label] of RAW_SCAN_SAFE_PATTERNS) {
 			if (pattern.test(result.stdout)) return `watchdog kill wrapping ${label}`
 		}
 		return null
@@ -114,12 +150,7 @@ export function classifyInfrastructureFailure(result: PiResult): string | null {
 		return "pi auto-retry exhausted"
 	}
 	// Look for a final agent_end with stopReason: "error" and an infra error message.
-	const agentEndPattern = /"type"\s*:\s*"agent_end"[^}]*"stopReason"\s*:\s*"error"[^}]*"errorMessage"\s*:\s*"([^"]*)"/g
-	let match: RegExpExecArray | null = null
-	let lastErrorMessage = ""
-	while ((match = agentEndPattern.exec(result.stdout)) !== null) {
-		lastErrorMessage = match[1] ?? ""
-	}
+	const lastErrorMessage = lastAgentEndErrorMessage(result.stdout)
 	if (lastErrorMessage) {
 		const label = matchedLabel(lastErrorMessage)
 		if (label) return label
@@ -853,6 +884,23 @@ export class Worker {
 		// events — project-bastion 2026-09-01).
 		const infraReason = classifyInfrastructureFailure(result)
 		if (infraReason) {
+			// Infra classification affects ONLY retry accounting — it must never
+			// destroy work or evidence. Save the transcript (six misclassified
+			// sessions on 2026-09-07 left zero evidence to diagnose with) and commit
+			// any WIP (the same night dropped ~7.5 hours of real work) before
+			// releasing the card unchanged.
+			try {
+				this.saveTranscript(card, result)
+			} catch {
+				// Evidence preservation is best-effort; the release below still runs.
+			}
+			if (this._repoWorkspace && githubRepo && workDir !== this.projectRoot) {
+				try {
+					await this._repoWorkspace.commitCardWork(workDir, card.id, card.columnId)
+				} catch {
+					// No changes to commit, or a transient git failure — not fatal.
+				}
+			}
 			this.dbStore.unclaimCard(card.id)
 			emitEvent(this.onEvent, { type: "blocked", cardId: card.id, reason: `pi session failed: ${infraReason}; leaving card unchanged for a later attempt` })
 			return

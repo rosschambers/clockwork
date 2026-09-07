@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test"
-import { Worker, type WorkerConfig, type WorkerEvent, type PiResult, isInfrastructureFailure, synthesizeWatchdogVerdict } from "./worker.ts"
+import { Worker, type WorkerConfig, type WorkerEvent, type PiResult, isInfrastructureFailure, classifyInfrastructureFailure, synthesizeWatchdogVerdict } from "./worker.ts"
 import { DbStore, type DbColumn } from "./db.ts"
 import { parseVerdict, extractAssistantText } from "./verdict.ts"
 import { randomUUID } from "node:crypto"
@@ -2195,5 +2195,110 @@ describe("Worker — watchdog kill yields a deterministic verdict", () => {
 
 		store.close()
 		fs.unlinkSync(path)
+	})
+})
+
+describe("classifyInfrastructureFailure — exit 124 requires terminal error evidence, not substrings in content", () => {
+	// The bare /503/ pattern was matched against the ENTIRE 8 MB stream: any
+	// watchdog-killed session whose transcript contained "503" as a plain number
+	// (an epoch timestamp, a token count, game tick data) was misclassified as
+	// infrastructure and its 75 minutes of work silently dropped — six sessions
+	// (~7.5 hours) in one night on project-bastion M2-03a (2026-09-07). Exit-124
+	// infra classification must require the marker in a terminal error context
+	// (agent_end errorMessage / auto_retry_end failure), never a bare substring
+	// match over session content.
+	it("does NOT classify a 124 whose content merely contains 503 as a number", () => {
+		const result: PiResult = {
+			stdout:
+				'{"type":"message_update","message":{"content":[{"type":"text","text":"wall falls at tick 213"}]},"timestamp":1788758503504}\n' +
+				'{"type":"toolcall_delta","text":"expect(wall_hp).to_equal(503)"}',
+			stderr: "\n[clockwork: pi killed after 4500000ms max-runtime watchdog]",
+			exitCode: 124,
+		}
+		expect(classifyInfrastructureFailure(result)).toBeNull()
+	})
+
+	it("classifies a 124 whose terminal agent_end errorMessage is a 503", () => {
+		const result: PiResult = {
+			stdout:
+				'{"type":"agent_end","messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"upstream 503 service unavailable"}],"willRetry":true}',
+			stderr: "\n[clockwork: pi killed after 4500000ms max-runtime watchdog]",
+			exitCode: 124,
+		}
+		expect(classifyInfrastructureFailure(result)).toContain("watchdog kill wrapping")
+	})
+
+	it("classifies a 124 with a failed auto_retry_end in the stream", () => {
+		const result: PiResult = {
+			stdout: '{"type":"auto_retry_end","attempts":4,"success":false}',
+			stderr: "\n[clockwork: pi killed after 4500000ms max-runtime watchdog]",
+			exitCode: 124,
+		}
+		expect(classifyInfrastructureFailure(result)).toContain("watchdog kill wrapping")
+	})
+})
+
+describe("Worker — infra-classified sessions preserve work and evidence", () => {
+	// The infra path returned BEFORE commitCardWork and saveTranscript: a
+	// misclassified session lost its work AND left no transcript to diagnose the
+	// misclassification with. Infra classification must only affect retry
+	// accounting — never destroy work or evidence.
+	it("commits WIP and saves the transcript when a session is classified as infrastructure failure", async () => {
+		const { store, path } = createTempDb()
+		const seeded = seedTestData(store)
+		store.updateProject(seeded.projectId, { githubRepo: "file:///tmp/fake-remote" })
+
+		const commitCalls: Array<{ cardId: string }> = []
+		const fakeWorkspace = {
+			prepareCardWorkspace: (
+				_projectId: string,
+				cardId: string,
+			): Promise<{ repoPath: string; branch: string }> =>
+				Promise.resolve({ repoPath: "/tmp/clockwork-fake-repo", branch: `card/${cardId}` }),
+			commitCardWork: (_repoPath: string, cardId: string): Promise<boolean> => {
+				commitCalls.push({ cardId })
+				return Promise.resolve(true)
+			},
+		}
+
+		const transcriptsDir = `/tmp/clockwork-transcripts-${randomUUID()}`
+		const worker = new Worker({
+			dbStore: store,
+			projectId: seeded.projectId,
+			token: "test",
+			workerId: "test-worker",
+			projectRoot: "/tmp",
+			transcriptsDir,
+			pollIntervalMs: 50,
+			maxRetries: 3,
+		})
+		worker.repoWorkspace = fakeWorkspace
+		// An unambiguous infra failure: preemption phrase inside a watchdog kill.
+		worker.invokePi = mock(() =>
+			Promise.resolve({
+				stdout:
+					'{"type":"agent_end","messages":[{"role":"assistant","content":[],"stopReason":"error","errorMessage":"503 preempted by higher-priority request"}],"willRetry":true}',
+				stderr: "\n[clockwork: pi killed after 4500000ms max-runtime watchdog]",
+				exitCode: 124,
+			}),
+		)
+
+		const claimed = await worker["claimCard"]()
+		await worker.processCard(claimed!)
+
+		// Work preserved despite the infra classification.
+		expect(commitCalls.length).toBeGreaterThanOrEqual(1)
+		// Evidence preserved: a transcript file exists for the card.
+		const cardDir = `${transcriptsDir}/${seeded.projectId}/${seeded.cardId}`
+		expect(fs.existsSync(cardDir)).toBe(true)
+		expect(fs.readdirSync(cardDir).length).toBeGreaterThanOrEqual(1)
+		// Card released unchanged: unclaimed, no retry consumed.
+		const card = store.getCardById(seeded.cardId)
+		expect(card!.claimState).toBeNull()
+		expect(card!.retryCount).toBe(0)
+
+		store.close()
+		fs.unlinkSync(path)
+		fs.rmSync(transcriptsDir, { recursive: true, force: true })
 	})
 })
