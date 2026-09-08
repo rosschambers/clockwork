@@ -53,6 +53,14 @@ export interface WorkerConfig {
 	// the same stage, up to maxPreemptionRetries, without consuming a card retry.
 	preemptionBackoffMs?: number
 	maxPreemptionRetries?: number
+	// Budget-kill closeout session: on a max-runtime (NOT inactivity) watchdog
+	// kill, run one short wrap-up pi session in the same workDir that commits WIP
+	// and emits an honest verdict, replacing the canned deterministic fail so a
+	// card actually finished at the buzzer can advance. Defaults on, with its own
+	// short watchdog independent of the work session's budget.
+	closeoutEnabled?: boolean
+	closeoutInactivityMs?: number
+	closeoutMaxRuntimeMs?: number
 }
 
 // A pi result is an arbiter preemption when the process failed (non-zero exit) and
@@ -173,7 +181,11 @@ export function isInfrastructureFailure(result: PiResult): boolean {
 // attempt to resume from the committed WIP instead of restarting.
 const WATCHDOG_KILL_PATTERN = /\[clockwork: pi killed after (\d+)ms (inactivity|max-runtime) watchdog\]/
 
-export function synthesizeWatchdogVerdict(result: PiResult): Verdict | null {
+// Classifies a pi result's watchdog kill as the budget hard-stop ("runtime") or a
+// silent/hung session ("inactivity"), or null when it was not a watchdog kill at
+// all. Single source of truth for both synthesizeWatchdogVerdict (below) and the
+// closeout router (processCard), which fires ONLY on a runtime kill.
+export function watchdogKillKind(result: PiResult): "inactivity" | "runtime" | null {
 	if (result.exitCode !== 124) {
 		return null
 	}
@@ -181,6 +193,14 @@ export function synthesizeWatchdogVerdict(result: PiResult): Verdict | null {
 	if (!match) {
 		return null
 	}
+	return match[2] === "inactivity" ? "inactivity" : "runtime"
+}
+
+export function synthesizeWatchdogVerdict(result: PiResult): Verdict | null {
+	if (watchdogKillKind(result) === null) {
+		return null
+	}
+	const match = result.stderr.match(WATCHDOG_KILL_PATTERN)!
 	const minutes = Math.round(Number(match[1]) / 60000)
 	const kind = match[2]
 	return {
@@ -306,6 +326,11 @@ export const PI_STREAM_CAPTURE_CAP_BYTES = 8 * 1024 * 1024
 // pi config must define -> http://frame:8185/v1 (dense 27B).
 export const DEFAULT_PI_PROVIDER = "frame-dense-low"
 
+// The closeout session gets its OWN short watchdog, independent of the work
+// session's budget, so a wrap-up cannot itself run for another hour.
+export const DEFAULT_CLOSEOUT_INACTIVITY_MS = 5 * 60 * 1000
+export const DEFAULT_CLOSEOUT_MAX_RUNTIME_MS = 12 * 60 * 1000
+
 // C4 extraction fallback prompt: when the work session omitted the verdict JSON,
 // a second call reads the transcript and emits ONLY the verdict object.
 const EXTRACTION_PROMPT = `You are a verdict extractor. Read the agent transcript below and decide the outcome of the stage. Output EXACTLY ONE JSON object and NOTHING else:
@@ -314,6 +339,31 @@ const EXTRACTION_PROMPT = `You are a verdict extractor. Read the agent transcrip
 - "fail": the work was attempted but did not meet the bar.
 - "blocked": the agent could not proceed.
 Do not add any prose before or after the JSON.`
+
+// Closeout prompt: fired when the work session hits the max-runtime (budget) hard
+// stop. Runs as a SECOND, short session in the same workDir — it must not continue
+// the feature work, only assess and record the current state honestly (git status,
+// the project's own gate command if documented, commit WIP, emit one verdict).
+export function buildCloseoutPrompt(card: { title: string; body: string }): string {
+	return [
+		"The work session for this card hit its time budget and was stopped. You are the CLOSEOUT session.",
+		"Your only job is to honestly assess and record the current state — do NOT start or continue implementing the feature.",
+		"",
+		"Steps, in order:",
+		"1. Run `git status` and review the working tree / diff to see what the work session actually produced.",
+		"2. If the repo documents a check/build/test command (AGENTS.md, PROJECT.md, justfile, package.json scripts), run it once to gauge whether the work is sound. If none exists, skip.",
+		"3. Commit anything uncommitted with a clear message (the work must survive for the next attempt).",
+		"4. Emit EXACTLY ONE JSON object and nothing else:",
+		'{"verdict": "pass" | "fail" | "blocked", "feedback": "<one sentence: what is done and what remains>", "artifacts": []}',
+		'- "pass": the card\'s acceptance criteria are DEMONSTRABLY met (gate green, deliverable present).',
+		'- "fail": real progress exists but the criteria are not yet met — name what remains in feedback.',
+		'- "blocked": you cannot assess the state.',
+		"",
+		"Card: " + card.title,
+		"",
+		card.body,
+	].join("\n")
+}
 
 // The subset of Bun.Subprocess that invokePi drives. Injected so tests supply a
 // fake subprocess (scheduled stdout/stderr chunks + controllable exit/kill) and
@@ -556,6 +606,9 @@ export class Worker {
 	public readonly piMaxRuntimeMs: number
 	public readonly preemptionBackoffMs: number
 	public readonly maxPreemptionRetries: number
+	public readonly closeoutEnabled: boolean
+	public readonly closeoutInactivityMs: number
+	public readonly closeoutMaxRuntimeMs: number
 
 	private running = false
 	private _loopPromise: Promise<void> = Promise.resolve()
@@ -584,6 +637,9 @@ export class Worker {
 		this.piMaxRuntimeMs = config.piMaxRuntimeMs ?? DEFAULT_PI_MAX_RUNTIME_MS
 		this.preemptionBackoffMs = config.preemptionBackoffMs ?? 30000
 		this.maxPreemptionRetries = config.maxPreemptionRetries ?? 20
+		this.closeoutEnabled = config.closeoutEnabled ?? true
+		this.closeoutInactivityMs = config.closeoutInactivityMs ?? DEFAULT_CLOSEOUT_INACTIVITY_MS
+		this.closeoutMaxRuntimeMs = config.closeoutMaxRuntimeMs ?? DEFAULT_CLOSEOUT_MAX_RUNTIME_MS
 	}
 
 	set invokePi(fn: InvokePiFn | null) {
@@ -915,6 +971,56 @@ export class Worker {
 		// the extractor model can only hallucinate about an empty transcript.
 		const watchdogVerdict = synthesizeWatchdogVerdict(result)
 		let verdict = watchdogVerdict ?? parseVerdict(replyText)
+		// The work session WAS a watchdog kill even if the closeout below replaces
+		// `verdict` with its own — route the switch's "fail" case on this, not on
+		// `watchdogVerdict !== null`, so a closeout fail still retries in place.
+		const wasWatchdogKill = watchdogVerdict !== null
+
+		// Budget-kill closeout: fires ONLY on the max-runtime (budget) hard-stop,
+		// never on an inactivity (hang) kill and never on a normal verdict — a
+		// second session on a genuinely hung box is pointless and risks a second
+		// hang, and spawning one for every ordinary pass/fail would be pure cost
+		// with no benefit. Strictly sequential: the work session's invokePi has
+		// already fully resolved above before this second invokeFn call is made.
+		if (this.closeoutEnabled && watchdogKillKind(result) === "runtime") {
+			emitEvent(this.onEvent, { type: "running", cardId: card.id })
+			try {
+				const closeout = await invokeFn({
+					prompt: buildCloseoutPrompt({ title: card.title, body: card.body }),
+					cwd: workDir,
+					provider: this.piProvider,
+					model: column.model ?? undefined,
+					inactivityMs: this.closeoutInactivityMs,
+					maxRuntimeMs: this.closeoutMaxRuntimeMs,
+					env: { CLOCKWORK_CARD_ID: card.id },
+				})
+				// The closeout's own watchdog kill, or an unparseable verdict, is NOT
+				// a strand condition — fall back to the deterministic watchdog verdict
+				// already computed above so behavior never regresses below today's.
+				if (watchdogKillKind(closeout) === null) {
+					const closeoutVerdict = parseVerdict(extractAssistantText(closeout.stdout))
+					if (!isParseFailureVerdict(closeoutVerdict)) {
+						verdict = closeoutVerdict
+						// Observability: the check-in surface must show the closeout ran and
+						// what it decided, not silently swallow it. Best-effort — wrapped so
+						// a transcript-write or database hiccup here cannot break
+						// processCard; the verdict has already been captured above.
+						try {
+							this.saveTranscript(card, closeout)
+							this.dbStore.addCardThreadEntry({
+								cardId: card.id,
+								entryType: "note",
+								content: `[closeout] ${closeoutVerdict.verdict}: ${closeoutVerdict.feedback}`,
+							})
+						} catch {
+							// Best-effort — see above.
+						}
+					}
+				}
+			} catch {
+				// Closeout is best-effort — keep the deterministic watchdog verdict.
+			}
+		}
 
 		// C4 — grammar-constrained verdict extraction fallback. If the verdict is
 		// blocked ONLY because the output had no parseable verdict (the model did the
@@ -1010,7 +1116,16 @@ export class Worker {
 				break
 			}
 			case "fail": {
-				await this.kickback(card, verdict)
+				// A watchdog-timeout kill is not evidence the plan was wrong — it is
+				// evidence the stage needs another attempt, resuming from the WIP
+				// already committed above (commitCardWork). Retry the SAME column
+				// instead of kicking back to the previous stage, which would force
+				// a full replanning session for a simple timeout.
+				if (wasWatchdogKill) {
+					await this.retryInPlace(card, verdict)
+				} else {
+					await this.kickback(card, verdict)
+				}
 				break
 			}
 			case "blocked": {
@@ -1247,6 +1362,85 @@ export class Worker {
 			cardId: card.id,
 			feedback: verdict.feedback,
 			artifacts: verdict.artifacts,
+		})
+	}
+
+	// A watchdog-timeout fail retries the SAME column instead of kicking back to
+	// the previous one: the timeout is not evidence the plan was wrong, and the
+	// WIP commit already made above plus synthesizeWatchdogVerdict's feedback mean
+	// the next attempt resumes rather than restarts. It still consumes THIS
+	// stage's retry budget — repeated timeouts at the same stage still park at
+	// needs-human, mirroring kickback's exhaustion path exactly. Unlike kickback,
+	// there is no prevColumn move and no resetting of another stage's counter.
+	private async retryInPlace(card: DbCard, verdict: Verdict): Promise<void> {
+		const currentStageCount = (card.stageRetries[card.columnId] ?? 0) + 1
+		const newStageRetries = { ...card.stageRetries, [card.columnId]: currentStageCount }
+		const newRetry = card.retryCount + 1
+
+		if (currentStageCount >= this.maxRetries) {
+			this.dbStore.updateCard(card.id, { retryCount: newRetry, stageRetries: newStageRetries })
+			const needsHumanColumn = this.dbStore
+				.getColumnsByProject(this.projectId)
+				.find((c) => c.name.toLowerCase().includes("human"))
+			if (!needsHumanColumn) {
+				// No needs-human column configured — a hard misconfiguration. Unclaim
+				// so the single worker isn't wedged; surface it loudly.
+				this.dbStore.unclaimCard(card.id)
+				emitEvent(this.onEvent, {
+					type: "needsHuman",
+					cardId: card.id,
+					reason: `Stage retry exhausted (${currentStageCount} >= ${this.maxRetries}) but NO needs-human column exists`,
+				})
+				return
+			}
+			const pos = this.dbStore
+				.getCardsByProject(this.projectId)
+				.filter((c) => c.columnId === needsHumanColumn.id).length
+
+			this.dbStore.moveCard(card.id, needsHumanColumn.id, pos, false)
+			this.dbStore.unclaimCard(card.id)
+
+			// Classify the last verdict's feedback into a fixed park reason and record
+			// it on the card thread, so the director sees a structured reason (not just
+			// free text) and downstream routing can key off it (design §3).
+			const parkReason = classifyParkReason(verdict.feedback)
+			this.dbStore.addCardThreadEntry({
+				cardId: card.id,
+				entryType: "park-reason",
+				content: parkReason,
+			})
+
+			await this.tryNotify({
+				type: "retry-exhausted",
+				projectId: this.projectId,
+				projectTitle: "",
+				cardId: card.id,
+				cardTitle: card.title,
+				column: needsHumanColumn.name,
+				feedback: `[${parkReason}] Stage retry count ${currentStageCount} >= max ${this.maxRetries}`,
+			})
+
+			emitEvent(this.onEvent, {
+				type: "needsHuman",
+				cardId: card.id,
+				reason: `[${parkReason}] Stage retry count ${currentStageCount} >= max ${this.maxRetries}`,
+			})
+
+			// Text Ross: this card is genuinely stuck (exhausted retries), with the
+			// classified park reason plus the last verdict's feedback as the block reason.
+			await this.trySms(smsForNeedsHuman(card.title, `[${parkReason}] ${verdict.feedback}`))
+			return
+		}
+
+		// Retry budget not yet exhausted: stay in the current column, unclaimed, so
+		// the worker (or another worker) re-picks the card and retries the same
+		// stage — resuming from the WIP already committed rather than restarting.
+		this.dbStore.updateCard(card.id, { retryCount: newRetry, stageRetries: newStageRetries })
+		this.dbStore.unclaimCard(card.id)
+		emitEvent(this.onEvent, {
+			type: "failed",
+			cardId: card.id,
+			feedback: verdict.feedback,
 		})
 	}
 

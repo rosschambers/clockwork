@@ -101,6 +101,17 @@ upkeep" in `AGENTS.md`).
     kill, zero verdict) — the defining failure mode for visual cards on the local model
     (project-bastion M1-08 and M1-20, 2026-08-30/31).
 
+    **Watchdog / budget behavior a tenant author should know (2026-09-07):** a session killed
+    by the *inactivity* watchdog (a genuine hang) records a deterministic fail and RETRIES THE
+    SAME STAGE (no kickback to replanning), resuming from committed WIP and still consuming that
+    stage's retry budget. A session killed by the *max-runtime* budget (the hard-stop) instead
+    runs a short **closeout session** in the same workspace first — it commits WIP, runs the
+    project's documented gate/check command, and emits an honest `pass|fail|blocked` verdict, so
+    a card finished right at the budget can advance rather than always retry. For this to help,
+    make sure the repo documents ONE bounded check/build/test command (in `AGENTS.md` /
+    `PROJECT.md` / a `justfile`) that the closeout can run. A model-*declared* `fail` still kicks
+    back one column as before.
+
 14. **(Optional) Add a Test-Writing column** — the TDD red phase, between Impl-Planning
     (position 200) and Implementation (position 300), at position 250 (first added on
     project-bastion). Create it via `POST /api/projects/:id/columns`. Its prompt duties: read

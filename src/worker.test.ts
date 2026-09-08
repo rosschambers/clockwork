@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test"
-import { Worker, type WorkerConfig, type WorkerEvent, type PiResult, isInfrastructureFailure, classifyInfrastructureFailure, synthesizeWatchdogVerdict } from "./worker.ts"
+import { Worker, type WorkerConfig, type WorkerEvent, type PiResult, isInfrastructureFailure, classifyInfrastructureFailure, synthesizeWatchdogVerdict, watchdogKillKind, buildCloseoutPrompt } from "./worker.ts"
 import { DbStore, type DbColumn } from "./db.ts"
 import { parseVerdict, extractAssistantText } from "./verdict.ts"
 import { randomUUID } from "node:crypto"
@@ -2146,6 +2146,40 @@ describe("synthesizeWatchdogVerdict", () => {
 	})
 })
 
+describe("watchdogKillKind", () => {
+	it("classifies runtime, inactivity, and non-watchdog results", () => {
+		expect(watchdogKillKind({ stdout: "", stderr: "[clockwork: pi killed after 3600000ms max-runtime watchdog]", exitCode: 124 })).toBe("runtime")
+		expect(watchdogKillKind({ stdout: "", stderr: "[clockwork: pi killed after 600000ms inactivity watchdog]", exitCode: 124 })).toBe("inactivity")
+		expect(watchdogKillKind({ stdout: "", stderr: "", exitCode: 124 })).toBeNull()
+		expect(watchdogKillKind({ stdout: "", stderr: "boom", exitCode: 1 })).toBeNull()
+	})
+})
+
+describe("buildCloseoutPrompt", () => {
+	it("forbids continuing work and demands a single verdict JSON", () => {
+		const p = buildCloseoutPrompt({ title: "Grid serializer", body: "AC: round-trips deterministically" })
+		expect(p).toContain("do NOT")
+		expect(p.toLowerCase()).toContain("git status")
+		expect(p).toContain('"verdict"')
+		expect(p).toContain("Grid serializer")
+		expect(p).toContain("round-trips deterministically")
+	})
+})
+
+describe("Worker — closeout knobs", () => {
+	it("defaults closeout knobs and honors overrides", () => {
+		const { store, path } = createTempDb()
+		const base = { dbStore: store, projectId: "p", token: "t", workerId: "w", projectRoot: "/tmp", transcriptsDir: "/tmp/x", pollIntervalMs: 50, maxRetries: 3, onEvent: () => {} }
+		const a = new Worker(base as unknown as WorkerConfig)
+		expect(a.closeoutEnabled).toBe(true)
+		expect(a.closeoutMaxRuntimeMs).toBe(12 * 60 * 1000)
+		const b = new Worker({ ...base, closeoutEnabled: false, closeoutMaxRuntimeMs: 60000 } as unknown as WorkerConfig)
+		expect(b.closeoutEnabled).toBe(false)
+		expect(b.closeoutMaxRuntimeMs).toBe(60000)
+		a.stop(); b.stop(); store.close(); fs.unlinkSync(path)
+	})
+})
+
 describe("Worker — watchdog kill yields a deterministic verdict", () => {
 	it("records a fail verdict naming the watchdog and never calls the extraction fallback", async () => {
 		const { store, path } = createTempDb()
@@ -2162,6 +2196,10 @@ describe("Worker — watchdog kill yields a deterministic verdict", () => {
 			pollIntervalMs: 50,
 			maxRetries: 3,
 			onEvent: (e) => events.push(e),
+			// This test is about the C4 extraction fallback never being consulted for
+			// a watchdog kill; the separate budget-kill closeout session (a second,
+			// distinct invokePi call) is exercised by its own describe block below.
+			closeoutEnabled: false,
 		})
 		// A session killed by the max-runtime watchdog mid-tool-grind: exit 124,
 		// stdout holds mid-stream events with no final assistant text.
@@ -2183,7 +2221,9 @@ describe("Worker — watchdog kill yields a deterministic verdict", () => {
 		expect(invocationCount).toBe(1)
 
 		// The recorded verdict is a deterministic fail naming the watchdog, and it
-		// flows through the normal kickback path (consumes a retry).
+		// flows through the retry-in-place path (consumes a retry, stays in the
+		// same column — there's only one column here so that isn't separately
+		// observable, but the "failed" event and retry consumption still fire).
 		const failed = events.find((e) => e.type === "failed")
 		expect(failed).toBeDefined()
 		expect((failed as { feedback: string }).feedback).toContain("max-runtime")
@@ -2300,5 +2340,358 @@ describe("Worker — infra-classified sessions preserve work and evidence", () =
 		store.close()
 		fs.unlinkSync(path)
 		fs.rmSync(transcriptsDir, { recursive: true, force: true })
+	})
+})
+
+describe("Worker — watchdog timeout retries in place", () => {
+	// A watchdog-timeout kill (exit 124) is not evidence the plan was wrong — it is
+	// evidence the SAME stage needs another attempt, resuming from the committed
+	// WIP synthesizeWatchdogVerdict points to. Unlike a model-declared "fail", it
+	// must not kick the card back to the previous column and force a full
+	// replanning session; it retries the current column in place while still
+	// consuming the per-stage retry budget so repeated timeouts still park.
+	let store: DbStore
+	let path: string
+	let projectId: string
+	let planningColumn: DbColumn
+	let implementationColumn: DbColumn
+	let needsHumanColumn: DbColumn
+	let cardId: string
+
+	beforeEach(() => {
+		const result = createTempDb()
+		store = result.store
+		path = result.path
+		const project = store.createProject({ name: "P", description: "", githubRepo: null, branch: null })
+		projectId = project.id
+		// Impl-Planning(0) -> Implementation(1) -> Done(2), plus a needs-human park
+		// column off the flow. The card starts at Implementation so a kickback
+		// (previous-column move) would be observable and distinguishable from an
+		// in-place retry.
+		planningColumn = store.createColumn({ projectId, name: "Impl-Planning", prompt: "Plan.", skills: [], model: null, position: 0 })
+		implementationColumn = store.createColumn({ projectId, name: "Implementation", prompt: "Implement.", skills: [], model: null, position: 1 })
+		store.createColumn({ projectId, name: "Done", prompt: "Final.", skills: [], model: null, position: 2 })
+		needsHumanColumn = store.createColumn({ projectId, name: "Needs Human", prompt: "Human.", skills: [], model: null, position: 99 })
+		const card = store.createCard({ projectId, columnId: implementationColumn.id, title: "Card", body: "Do it.", position: 0 })
+		cardId = card.id
+	})
+
+	afterEach(() => {
+		store.close()
+		fs.unlinkSync(path)
+	})
+
+	function watchdogResult(): PiResult {
+		return {
+			stdout: '{"type":"tool_call","name":"bash","arguments":{"command":"run tests"}}',
+			stderr: "\n[clockwork: pi killed after 3600000ms max-runtime watchdog]",
+			exitCode: 124,
+		}
+	}
+
+	it("a single watchdog timeout keeps the card in the same column, unclaims it, and increments only the current stage's retry counter", async () => {
+		const worker = new Worker({
+			dbStore: store,
+			projectId,
+			token: "test",
+			workerId: "test-worker",
+			projectRoot: "/tmp",
+			transcriptsDir: `/tmp/clockwork-transcripts-${randomUUID()}`,
+			pollIntervalMs: 50,
+			maxRetries: 3,
+			onEvent: () => {},
+		})
+		worker.invokePi = mock(() => Promise.resolve(watchdogResult()))
+
+		const claimed = await worker["claimCard"]()
+		expect(claimed!.columnId).toBe(implementationColumn.id)
+		await worker.processCard(claimed!)
+
+		const after = store.getCardById(cardId)
+		expect(after).not.toBeNull()
+		expect(after!.columnId).toBe(implementationColumn.id)
+		expect(after!.claimState).toBeNull()
+		expect(after!.stageRetries[implementationColumn.id]).toBe(1)
+
+		worker.stop()
+		await worker.stopped()
+	})
+
+	it("a watchdog timeout does not move the card to the previous column", async () => {
+		const worker = new Worker({
+			dbStore: store,
+			projectId,
+			token: "test",
+			workerId: "test-worker",
+			projectRoot: "/tmp",
+			transcriptsDir: `/tmp/clockwork-transcripts-${randomUUID()}`,
+			pollIntervalMs: 50,
+			maxRetries: 3,
+			onEvent: () => {},
+		})
+		worker.invokePi = mock(() => Promise.resolve(watchdogResult()))
+
+		const claimed = await worker["claimCard"]()
+		await worker.processCard(claimed!)
+
+		const after = store.getCardById(cardId)
+		expect(after!.columnId).not.toBe(planningColumn.id)
+
+		worker.stop()
+		await worker.stopped()
+	})
+
+	it("after maxRetries consecutive watchdog timeouts at the same stage, the card parks at needs-human", async () => {
+		const events: WorkerEvent[] = []
+		const worker = new Worker({
+			dbStore: store,
+			projectId,
+			token: "test",
+			workerId: "test-worker",
+			projectRoot: "/tmp",
+			transcriptsDir: `/tmp/clockwork-transcripts-${randomUUID()}`,
+			pollIntervalMs: 50,
+			maxRetries: 3,
+			onEvent: (e) => events.push(e),
+		})
+		worker.invokePi = mock(() => Promise.resolve(watchdogResult()))
+
+		for (let i = 0; i < 3; i++) {
+			const card = await worker["claimCard"]()
+			if (card === null) {
+				break
+			}
+			expect(card.columnId).toBe(implementationColumn.id)
+			await worker.processCard(card)
+		}
+
+		const parked = store.getCardById(cardId)
+		expect(parked!.columnId).toBe(needsHumanColumn.id)
+		expect(events.some((e) => e.type === "needsHuman")).toBe(true)
+		expect(await worker["claimCard"]()).toBeNull()
+
+		worker.stop()
+		await worker.stopped()
+	})
+
+	it("a normal model-declared fail still kicks back one column (regression guard)", async () => {
+		const worker = new Worker({
+			dbStore: store,
+			projectId,
+			token: "test",
+			workerId: "test-worker",
+			projectRoot: "/tmp",
+			transcriptsDir: `/tmp/clockwork-transcripts-${randomUUID()}`,
+			pollIntervalMs: 50,
+			maxRetries: 3,
+			onEvent: () => {},
+		})
+		worker.invokePi = mock(() =>
+			Promise.resolve({
+				stdout: piJsonStream({ verdict: "fail", feedback: "Tests failed." }),
+				stderr: "",
+				exitCode: 1,
+			})
+		)
+
+		const claimed = await worker["claimCard"]()
+		await worker.processCard(claimed!)
+
+		const after = store.getCardById(cardId)
+		expect(after!.columnId).toBe(planningColumn.id)
+
+		worker.stop()
+		await worker.stopped()
+	})
+})
+
+describe("Worker — budget-kill closeout session", () => {
+	// Impl-Planning(0) -> Implementation(1) -> Done(2), plus a needs-human park
+	// column, mirroring the "watchdog timeout retries in place" setup so a
+	// kickback (previous-column move) is distinguishable from an in-place retry
+	// or a forward advance.
+	let store: DbStore
+	let path: string
+	let projectId: string
+	let planningColumn: DbColumn
+	let implementationColumn: DbColumn
+	let needsHumanColumn: DbColumn
+	let cardId: string
+
+	beforeEach(() => {
+		const result = createTempDb()
+		store = result.store
+		path = result.path
+		const project = store.createProject({ name: "P", description: "", githubRepo: null, branch: null })
+		projectId = project.id
+		planningColumn = store.createColumn({ projectId, name: "Impl-Planning", prompt: "Plan.", skills: [], model: null, position: 0 })
+		implementationColumn = store.createColumn({ projectId, name: "Implementation", prompt: "Implement.", skills: [], model: null, position: 1 })
+		store.createColumn({ projectId, name: "Done", prompt: "Final.", skills: [], model: null, position: 2 })
+		needsHumanColumn = store.createColumn({ projectId, name: "Needs Human", prompt: "Human.", skills: [], model: null, position: 99 })
+		const card = store.createCard({ projectId, columnId: implementationColumn.id, title: "Card", body: "Do it.", position: 0 })
+		cardId = card.id
+	})
+
+	afterEach(() => {
+		store.close()
+		fs.unlinkSync(path)
+	})
+
+	function runtimeKill(): PiResult {
+		return { stdout: "", stderr: "\n[clockwork: pi killed after 3600000ms max-runtime watchdog]", exitCode: 124 }
+	}
+
+	function inactivityKill(): PiResult {
+		return { stdout: "", stderr: "\n[clockwork: pi killed after 600000ms inactivity watchdog]", exitCode: 124 }
+	}
+
+	function makeWorker(overrides?: Partial<WorkerConfig>): Worker {
+		return new Worker({
+			dbStore: store,
+			projectId,
+			token: "test",
+			workerId: "test-worker",
+			projectRoot: "/tmp",
+			transcriptsDir: `/tmp/clockwork-transcripts-${randomUUID()}`,
+			pollIntervalMs: 50,
+			maxRetries: 3,
+			onEvent: () => {},
+			...overrides,
+		})
+	}
+
+	it("a runtime kill runs a closeout session whose PASS advances the card", async () => {
+		const worker = makeWorker()
+		let calls = 0
+		worker.invokePi = mock(() => {
+			calls += 1
+			return Promise.resolve(
+				calls === 1
+					? runtimeKill()
+					: { stdout: piJsonStream({ verdict: "pass", feedback: "AC met" }), stderr: "", exitCode: 0 },
+			)
+		})
+
+		const claimed = await worker["claimCard"]()
+		await worker.processCard(claimed!)
+
+		expect(calls).toBe(2)
+		const after = store.getCardById(cardId)
+		expect(after!.columnId).not.toBe(implementationColumn.id)
+		expect(after!.columnId).not.toBe(planningColumn.id)
+		expect(after!.stageRetries[implementationColumn.id] ?? 0).toBe(0)
+
+		worker.stop()
+		await worker.stopped()
+	})
+
+	it("a runtime kill whose closeout returns FAIL retries in place (same column, +1 stage retry)", async () => {
+		const worker = makeWorker()
+		let calls = 0
+		worker.invokePi = mock(() => {
+			calls += 1
+			return Promise.resolve(
+				calls === 1
+					? runtimeKill()
+					: { stdout: piJsonStream({ verdict: "fail", feedback: "boss AI still stubbed" }), stderr: "", exitCode: 0 },
+			)
+		})
+
+		const claimed = await worker["claimCard"]()
+		await worker.processCard(claimed!)
+
+		expect(calls).toBe(2)
+		const after = store.getCardById(cardId)
+		expect(after!.columnId).toBe(implementationColumn.id)
+		expect(after!.claimState).toBeNull()
+		expect(after!.stageRetries[implementationColumn.id]).toBe(1)
+
+		worker.stop()
+		await worker.stopped()
+	})
+
+	it("an INACTIVITY kill does NOT run a closeout (single invokePi, canned fail, retry-in-place)", async () => {
+		const worker = makeWorker()
+		let calls = 0
+		worker.invokePi = mock(() => {
+			calls += 1
+			return Promise.resolve(inactivityKill())
+		})
+
+		const claimed = await worker["claimCard"]()
+		await worker.processCard(claimed!)
+
+		expect(calls).toBe(1)
+		const after = store.getCardById(cardId)
+		expect(after!.columnId).toBe(implementationColumn.id)
+		expect(after!.stageRetries[implementationColumn.id]).toBe(1)
+
+		worker.stop()
+		await worker.stopped()
+	})
+
+	it("a closeout that itself watchdog-kills falls back to the deterministic fail (retry-in-place)", async () => {
+		const worker = makeWorker()
+		let calls = 0
+		worker.invokePi = mock(() => {
+			calls += 1
+			return Promise.resolve(runtimeKill())
+		})
+
+		const claimed = await worker["claimCard"]()
+		await expect(worker.processCard(claimed!)).resolves.toBeUndefined()
+
+		expect(calls).toBe(2)
+		const after = store.getCardById(cardId)
+		expect(after!.columnId).toBe(implementationColumn.id)
+		expect(after!.stageRetries[implementationColumn.id]).toBe(1)
+
+		worker.stop()
+		await worker.stopped()
+	})
+
+	it("records the closeout as a thread note when it returns a parseable verdict", async () => {
+		const worker = makeWorker()
+		let calls = 0
+		worker.invokePi = mock(() => {
+			calls += 1
+			return Promise.resolve(
+				calls === 1
+					? runtimeKill()
+					: { stdout: piJsonStream({ verdict: "pass", feedback: "AC met" }), stderr: "", exitCode: 0 },
+			)
+		})
+
+		const claimed = await worker["claimCard"]()
+		await worker.processCard(claimed!)
+
+		const thread = store.getCardThreads(cardId)
+		const closeoutNote = thread.find((t) => t.entryType === "note" && t.content.includes("[closeout]"))
+		expect(closeoutNote).toBeDefined()
+		expect(closeoutNote!.content).toContain("pass")
+		expect(closeoutNote!.content).toContain("AC met")
+
+		worker.stop()
+		await worker.stopped()
+	})
+
+	it("closeoutEnabled=false skips the closeout entirely", async () => {
+		const worker = makeWorker({ closeoutEnabled: false })
+		let calls = 0
+		worker.invokePi = mock(() => {
+			calls += 1
+			return Promise.resolve(runtimeKill())
+		})
+
+		const claimed = await worker["claimCard"]()
+		await worker.processCard(claimed!)
+
+		expect(calls).toBe(1)
+		const after = store.getCardById(cardId)
+		expect(after!.columnId).toBe(implementationColumn.id)
+		expect(after!.stageRetries[implementationColumn.id]).toBe(1)
+
+		worker.stop()
+		await worker.stopped()
 	})
 })
