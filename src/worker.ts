@@ -285,7 +285,7 @@ export interface PiInvocation {
 	prompt: string
 	cwd: string
 	// pi provider carrying the endpoint. Defaults to the arbiter LOW port
-	// (frame-dense-low) so clockwork work is background/preemptible by design.
+	// (frame-flash-low) so clockwork work is background/preemptible by design.
 	provider?: string
 	model?: string
 	skills?: string[]
@@ -323,8 +323,8 @@ export const PI_STREAM_CAPTURE_CAP_BYTES = 8 * 1024 * 1024
 
 // clockwork is background work by definition, so it targets the frame-arbiter
 // LOW port (a Hugo request preempts it). This is the provider the container's
-// pi config must define -> http://frame:8185/v1 (dense 27B).
-export const DEFAULT_PI_PROVIDER = "frame-dense-low"
+// pi config must define -> http://frame:8185/v1 (flash 180B, Qwen3.8-Flash-Next).
+export const DEFAULT_PI_PROVIDER = "frame-flash-low"
 
 // The closeout session gets its OWN short watchdog, independent of the work
 // session's budget, so a wrap-up cannot itself run for another hour.

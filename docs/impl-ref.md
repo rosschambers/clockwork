@@ -80,7 +80,7 @@ Exports: `Verdict` interface (`verdict: 'pass'|'fail'|'blocked'`, `feedback`, `a
 
 Exports: `WorkerConfig`, `WorkerEvent`, `PiResult`, `invokePi()`, `Worker` class.
 
-`WorkerConfig`: `dbStore`, `projectId`, `token`, `workerId`, `piCommand?`, `maxRetries?` (default 3), `pollIntervalMs?` (default 5000), `projectRoot`, `transcriptsDir`, `tokenBudget?`, `piProvider?` (default `frame-dense-low`), `onEvent?`, `notifyUrl?`/`notifyToken?` (clockwork event webhook, Bearer), `smsUrl?`/`smsToken?` (SMS-to-Ross via exocortex `async-workload-complete`, `{token,message}` body), `milestoneLabel?`, `buildCopyCommand?`. Injectable (setter) hooks: `worker.invokePi` and `worker.repoWorkspace` (a `RepoWorkspaceLike`).
+`WorkerConfig`: `dbStore`, `projectId`, `token`, `workerId`, `piCommand?`, `maxRetries?` (default 3), `pollIntervalMs?` (default 5000), `projectRoot`, `transcriptsDir`, `tokenBudget?`, `piProvider?` (default `frame-flash-low`), `onEvent?`, `notifyUrl?`/`notifyToken?` (clockwork event webhook, Bearer), `smsUrl?`/`smsToken?` (SMS-to-Ross via exocortex `async-workload-complete`, `{token,message}` body), `milestoneLabel?`, `buildCopyCommand?`. Injectable (setter) hooks: `worker.invokePi` and `worker.repoWorkspace` (a `RepoWorkspaceLike`).
 
 `Worker.start()`: polls, claims (see claim rules below), then per card: prepare a per-card git workspace → run pi via `invokePi` in that workspace → parse verdict (with a grammar-constrained extraction retry on a parse-failure blocked) → commit the card's work on its branch → move card. Movement: pass→forward, fail→kickback (back one column, +1 retry), blocked→kickback (resolves the card, does NOT stay/stall), retry≥max→needsHuman.
 
