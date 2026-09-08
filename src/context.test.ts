@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "bun:test"
-import { ContextAssembler, type ContextAssemblerOptions, type PlanSlice, type ThreadEntry, type AssembledContext } from "./context.ts"
+import { ContextAssembler, loadTargetFiles, type ContextAssemblerOptions, type PlanSlice, type ThreadEntry, type AssembledContext } from "./context.ts"
 import fs from "node:fs"
 import path from "node:path"
 
@@ -717,5 +717,96 @@ describe("ContextAssembler — thread entry formatting", () => {
 
 		expect(firstIndex).toBeLessThan(secondIndex)
 		expect(secondIndex).toBeLessThan(thirdIndex)
+	})
+})
+
+describe("loadTargetFiles", () => {
+	let workDir: string
+	let cleanup: () => void
+
+	beforeEach(() => {
+		workDir = path.join("/tmp", `clockwork-targets-test-${crypto.randomUUID()}`)
+		fs.mkdirSync(workDir, { recursive: true })
+		cleanup = (): void => {
+			fs.rmSync(workDir, { recursive: true, force: true })
+		}
+	})
+
+	afterEach(() => {
+		cleanup()
+	})
+
+	function writeFile(relativePath: string, content: string): void {
+		const fullPath = path.join(workDir, relativePath)
+		fs.mkdirSync(path.dirname(fullPath), { recursive: true })
+		fs.writeFileSync(fullPath, content)
+	}
+
+	it("returns empty array for empty targets", () => {
+		const result = loadTargetFiles([], workDir, 100000)
+		expect(result).toEqual([])
+	})
+
+	it("reads existing files and returns PlanSlice objects with correct paths and contents", () => {
+		writeFile("scripts/main.gd", "extends Node\n\nfunc _ready():\n\tpass\n")
+
+		const result = loadTargetFiles(["scripts/main.gd"], workDir, 100000)
+
+		const slice = result.find((s) => s.id === "scripts/main.gd")
+		expect(slice).toBeDefined()
+		expect(slice!.title).toBe("scripts/main.gd")
+		expect(slice!.content).toBe("extends Node\n\nfunc _ready():\n\tpass\n")
+		expect(slice!.relevantCardIds).toEqual([])
+	})
+
+	it("silently skips missing files", () => {
+		const result = loadTargetFiles(["scripts/does_not_exist.gd"], workDir, 100000)
+		expect(result).toEqual([])
+	})
+
+	it("deduplicates when a target and its counterpart are both in the list", () => {
+		writeFile("scripts/foo.gd", "foo content")
+		writeFile("tests/test_foo.gd", "foo test content")
+
+		const result = loadTargetFiles(["scripts/foo.gd", "tests/test_foo.gd"], workDir, 100000)
+
+		const ids = result.map((s) => s.id)
+		expect(ids).toEqual(["scripts/foo.gd", "tests/test_foo.gd"])
+	})
+
+	it("truncates large files when total exceeds maxChars", () => {
+		const bigContent = "x".repeat(1000)
+		const smallContent = "y".repeat(10)
+		writeFile("scripts/big.gd", bigContent)
+		writeFile("scripts/small.gd", smallContent)
+
+		const result = loadTargetFiles(["scripts/big.gd", "scripts/small.gd"], workDir, 100)
+
+		const big = result.find((s) => s.id === "scripts/big.gd")
+		const small = result.find((s) => s.id === "scripts/small.gd")
+		expect(big!.content).toBe("[File too large — read via tool call]")
+		expect(small!.content).toBe(smallContent)
+	})
+
+	it("includes test counterparts (scripts/foo.gd -> tests/test_foo.gd)", () => {
+		writeFile("scripts/grid_combat.gd", "combat logic")
+		writeFile("tests/test_grid_combat.gd", "combat tests")
+
+		const result = loadTargetFiles(["scripts/grid_combat.gd"], workDir, 100000)
+
+		const ids = result.map((s) => s.id)
+		expect(ids).toContain("scripts/grid_combat.gd")
+		expect(ids).toContain("tests/test_grid_combat.gd")
+	})
+
+	it("includes reverse test counterparts (tests/test_foo.gd -> scripts/foo.gd)", () => {
+		writeFile("tests/test_grid_combat.gd", "combat tests")
+		writeFile("scripts/grid_combat.gd", "combat logic")
+
+		const result = loadTargetFiles(["tests/test_grid_combat.gd"], workDir, 100000)
+
+		const ids = result.map((s) => s.id)
+		expect(ids).toContain("tests/test_grid_combat.gd")
+		expect(ids).toContain("scripts/grid_combat.gd")
 	})
 })

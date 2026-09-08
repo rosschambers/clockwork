@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test"
-import { Worker, type WorkerConfig, type WorkerEvent, type PiResult, isInfrastructureFailure, classifyInfrastructureFailure, synthesizeWatchdogVerdict, watchdogKillKind, buildCloseoutPrompt } from "./worker.ts"
+import { Worker, type WorkerConfig, type WorkerEvent, type PiResult, isInfrastructureFailure, classifyInfrastructureFailure, synthesizeWatchdogVerdict, watchdogKillKind, buildCloseoutPrompt, extractFilesTouched, extractTestResults, buildSessionNote } from "./worker.ts"
 import { DbStore, type DbColumn } from "./db.ts"
 import { parseVerdict, extractAssistantText } from "./verdict.ts"
 import { randomUUID } from "node:crypto"
@@ -2163,6 +2163,136 @@ describe("buildCloseoutPrompt", () => {
 		expect(p).toContain('"verdict"')
 		expect(p).toContain("Grid serializer")
 		expect(p).toContain("round-trips deterministically")
+	})
+})
+
+describe("extractFilesTouched", () => {
+	it("extracts Read/Write/Edit tool-call file paths from a pi event stream", () => {
+		const stdout =
+			'{"type":"tool_call","name":"Read","input":{"filePath":"scripts/grid_combat.gd"}}\n' +
+			'{"type":"tool_call","name":"Write","input":{"filePath":"tests/test_grid_combat.gd"}}\n' +
+			'{"type":"tool_call","name":"Edit","input":{"path":"scripts/main.gd"}}\n'
+
+		const touched = extractFilesTouched(stdout)
+
+		expect(touched).toEqual([
+			{ action: "read", path: "scripts/grid_combat.gd" },
+			{ action: "write", path: "tests/test_grid_combat.gd" },
+			{ action: "edit", path: "scripts/main.gd" },
+		])
+	})
+
+	it("deduplicates repeated tool calls on the same file", () => {
+		const stdout =
+			'{"type":"tool_call","name":"Read","input":{"filePath":"scripts/grid_combat.gd"}}\n' +
+			'{"type":"tool_call","name":"Read","input":{"filePath":"scripts/grid_combat.gd"}}\n'
+
+		expect(extractFilesTouched(stdout)).toEqual([
+			{ action: "read", path: "scripts/grid_combat.gd" },
+		])
+	})
+
+	it("returns an empty array when no tool-call file events are present", () => {
+		expect(extractFilesTouched('{"type":"turn_start"}')).toEqual([])
+	})
+})
+
+describe("extractTestResults", () => {
+	it("extracts an 'N run, M failed' line", () => {
+		expect(extractTestResults("Running suite...\ntests: 171 run, 16 failed\ndone")).toEqual({
+			run: 171,
+			failed: 16,
+		})
+	})
+
+	it("returns null when no test-result line is present", () => {
+		expect(extractTestResults("no tests here")).toBeNull()
+	})
+})
+
+describe("buildSessionNote", () => {
+	it("produces a note with files touched and test results", () => {
+		const stdout =
+			'{"type":"tool_call","name":"Read","input":{"filePath":"scripts/grid_combat.gd"}}\n' +
+			'{"type":"tool_call","name":"Write","input":{"filePath":"tests/test_grid_combat.gd"}}\n' +
+			"tests: 171 run, 16 failed\n"
+
+		const note = buildSessionNote({
+			stdout,
+			replyText: "Implemented melee engagement, reached line 45 of the function.",
+			headCommit: "824fb16 clockwork: card-1 (Implementation)",
+		})
+
+		expect(note).toContain("scripts/grid_combat.gd (read)")
+		expect(note).toContain("tests/test_grid_combat.gd (write)")
+		expect(note).toContain("Tests: 171/16 failed")
+		expect(note).toContain("HEAD: 824fb16 clockwork: card-1 (Implementation)")
+		expect(note).toContain("Remaining: Implemented melee engagement, reached line 45 of the function.")
+		expect(note.length).toBeGreaterThan(0)
+	})
+
+	it("degrades gracefully when there is nothing to extract", () => {
+		const note = buildSessionNote({ stdout: "", replyText: "", headCommit: null })
+		expect(note).toContain("no extractable activity")
+	})
+
+	it("truncates the remaining-work tail to the last ~500 characters", () => {
+		const longReply = "x".repeat(1000)
+		const note = buildSessionNote({ stdout: "", replyText: longReply, headCommit: null })
+		expect(note).toContain("Remaining: " + "x".repeat(500))
+		expect(note).not.toContain("x".repeat(501))
+	})
+})
+
+describe("Worker — session note saved as a thread entry after processCard", () => {
+	it("extracts files touched and test results into a note thread entry", async () => {
+		const { store, path } = createTempDb()
+		const seeded = seedTestData(store)
+
+		store.createColumn({
+			projectId: seeded.projectId,
+			name: "Done",
+			prompt: "Final stage.",
+			skills: [],
+			model: null,
+			position: 1,
+		})
+
+		const worker = new Worker({
+			dbStore: store,
+			projectId: seeded.projectId,
+			token: "test",
+			workerId: "test-worker",
+			projectRoot: "/tmp",
+			transcriptsDir: "/tmp/clockwork-transcripts",
+			pollIntervalMs: 50,
+			maxRetries: 3,
+		})
+
+		const stdoutWithToolCalls =
+			'{"type":"tool_call","name":"Read","input":{"filePath":"scripts/grid_combat.gd"}}\n' +
+			'{"type":"tool_call","name":"Write","input":{"filePath":"tests/test_grid_combat.gd"}}\n' +
+			"tests: 12 run, 2 failed\n" +
+			piJsonStream({ verdict: "pass", feedback: "All tests green." })
+
+		worker.invokePi = mock(
+			(_invocation) =>
+				Promise.resolve({ stdout: stdoutWithToolCalls, stderr: "", exitCode: 0 }),
+		)
+
+		await startWorker(worker)
+
+		const threads = store.getCardThreads(seeded.cardId)
+		const note = threads.find((t) => t.entryType === "note")
+		expect(note).toBeDefined()
+		expect(note!.content).toContain("scripts/grid_combat.gd (read)")
+		expect(note!.content).toContain("tests/test_grid_combat.gd (write)")
+		expect(note!.content).toContain("Tests: 12/2 failed")
+
+		worker.stop()
+		await worker.stopped()
+		store.close()
+		fs.unlinkSync(path)
 	})
 })
 

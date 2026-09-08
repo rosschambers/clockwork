@@ -1,11 +1,12 @@
 import { parseVerdict, extractAssistantText, isParseFailureVerdict, type Verdict } from "./verdict.ts"
 import { DbStore, type DbCard, type DbColumn } from "./db.ts"
 import { notify, columnNotificationType, sendSms, smsForNeedsHuman, smsForMilestoneComplete, type NotifyEvent } from "./notify.ts"
-import { assembleContext, type ThreadEntry } from "./context.ts"
+import { assembleContext, loadTargetFiles, type ThreadEntry } from "./context.ts"
 import { classifyParkReason } from "./classify.ts"
 import { targetsSatisfied } from "./gate.ts"
 import path from "node:path"
 import { mkdirSync, writeFileSync } from "node:fs"
+import { execSync } from "node:child_process"
 
 // Appended to every column prompt so the model ends with a machine-parseable
 // verdict. A missing/malformed verdict is treated as `blocked` by parseVerdict.
@@ -363,6 +364,120 @@ export function buildCloseoutPrompt(card: { title: string; body: string }): stri
 		"",
 		card.body,
 	].join("\n")
+}
+
+// Layer 3 — cross-session context (session notes). Mechanical extraction from a
+// pi `--mode json` event stream: grep for tool-call events naming Read/Write/Edit
+// and their file argument. Deliberately NOT a full JSON-event parse (per the
+// design doc) — a bare regex over the raw stdout string is enough and cannot
+// throw on a truncated/malformed stream. Assumes pi's JSON event format puts
+// "name" before the input object — if pi ever reorders keys, this needs
+// updating or a per-line JSON.parse.
+const TOOL_FILE_PATTERN = /"name"\s*:\s*"(Read|Write|Edit)"[^}]*"(filePath|path)"\s*:\s*"([^"]*)"/g
+
+export interface TouchedFile {
+	action: string
+	path: string
+}
+
+export function extractFilesTouched(stdout: string): TouchedFile[] {
+	const seen = new Set<string>()
+	const touched: TouchedFile[] = []
+	for (const match of stdout.matchAll(TOOL_FILE_PATTERN)) {
+		const action = match[1]
+		const filePath = match[3]
+		if (action === undefined || filePath === undefined || filePath.length === 0) {
+			continue
+		}
+		const key = `${action}:${filePath}`
+		if (seen.has(key)) {
+			continue
+		}
+		seen.add(key)
+		touched.push({ action: action.toLowerCase(), path: filePath })
+	}
+	return touched
+}
+
+// Layer 3 — mechanical extraction of a godot/test-runner "N run, M failed" line
+// from anywhere in the stdout stream.
+const TEST_RESULT_PATTERN = /tests:\s*(\d+)\s*run,\s*(\d+)\s*failed/i
+
+export interface TestResultSummary {
+	run: number
+	failed: number
+}
+
+export function extractTestResults(stdout: string): TestResultSummary | null {
+	const match = TEST_RESULT_PATTERN.exec(stdout)
+	if (match === null) {
+		return null
+	}
+	const run = Number(match[1])
+	const failed = Number(match[2])
+	if (Number.isNaN(run) || Number.isNaN(failed)) {
+		return null
+	}
+	return { run, failed }
+}
+
+export interface SessionNoteInput {
+	stdout: string
+	replyText: string
+	headCommit?: string | null
+}
+
+// Build the ~200-500 char structured session note (design doc Layer 3): files
+// touched, test results, HEAD commit, and the model's last thoughts before the
+// session ended (the last ~500 chars of assistant text). Deterministic string
+// assembly — no LLM call, no summarization model, no hallucination risk.
+export function buildSessionNote(input: SessionNoteInput): string {
+	const touched = extractFilesTouched(input.stdout)
+	const testResults = extractTestResults(input.stdout)
+	const remaining = input.replyText.slice(-500).trim()
+
+	const parts: string[] = []
+
+	if (touched.length > 0) {
+		const filesList = touched.map((t) => `${t.path} (${t.action})`).join(", ")
+		parts.push(`touched ${filesList}`)
+	}
+
+	if (testResults !== null) {
+		parts.push(`Tests: ${testResults.run}/${testResults.failed} failed`)
+	}
+
+	if (input.headCommit) {
+		parts.push(`HEAD: ${input.headCommit}`)
+	}
+
+	if (remaining.length > 0) {
+		parts.push(`Remaining: ${remaining}`)
+	}
+
+	if (parts.length === 0) {
+		return `Session ${new Date().toISOString()}: no extractable activity.`
+	}
+
+	return `Session ${new Date().toISOString()}: ${parts.join(". ")}.`
+}
+
+// Best-effort HEAD commit lookup for the session note. Returns null (never
+// throws) when workDir is not a git repo, git is unavailable, or the command
+// fails for any other reason — a missing HEAD line is not worth failing over.
+function getHeadCommitOneline(workDir: string): string | null {
+	try {
+		const output = execSync("git log --oneline -1", {
+			cwd: workDir,
+			encoding: "utf8",
+			timeout: 5000,
+			stdio: ["ignore", "pipe", "ignore"],
+		})
+		const trimmed = output.trim()
+		return trimmed.length > 0 ? trimmed : null
+	} catch {
+		return null
+	}
 }
 
 // The subset of Bun.Subprocess that invokePi drives. Injected so tests supply a
@@ -832,28 +947,12 @@ export class Worker {
 			return
 		}
 
-		// Assemble a short, fresh session: column prompt + card + verdict contract
-		// as the column-extras tier, plus PROJECT.md and the card's feedback thread.
-		const thread: ThreadEntry[] = this.dbStore.getCardThreads(card.id).map((t) => ({
-			id: t.id,
-			entryType: normalizeThreadType(t.entryType),
-			timestamp: t.createdAt.getTime(),
-			content: t.content,
-		}))
-		const columnExtras = `# Stage: ${column.name}\n\n${column.prompt}\n\n## Card: ${card.title}\n\n${card.body}${VERDICT_INSTRUCTION}`
-		const assembled = assembleContext({
-			projectRoot: this.projectRoot,
-			planFiles: [],
-			cardThread: thread,
-			columnExtras,
-			cardId: card.id,
-			tokenBudget: this.tokenBudget,
-		})
-
 		// Per-card git workspace: check out a `card/<id>` branch so each card's work
 		// is isolated and, on success, committed with the card id (design decision 6,
 		// "branch-per-card"). If no workspace is configured or the project has no repo,
-		// fall back to the shared projectRoot so a repo-less project still runs.
+		// fall back to the shared projectRoot so a repo-less project still runs. This
+		// must resolve BEFORE context assembly so target-file pre-loading (below)
+		// reads from the card's actual workspace, not just the shared project root.
 		let workDir = this.projectRoot
 		const project = this.dbStore.getProjectById(this.projectId)
 		const githubRepo = project?.githubRepo ?? null
@@ -891,6 +990,30 @@ export class Worker {
 				return
 			}
 		}
+
+		// Assemble a short, fresh session: column prompt + card + verdict contract
+		// as the column-extras tier, plus PROJECT.md, pre-loaded target files (Layer
+		// 1 — the model should not have to tool-call-read files it will edit anyway),
+		// and the card's feedback thread.
+		const thread: ThreadEntry[] = this.dbStore.getCardThreads(card.id).map((t) => ({
+			id: t.id,
+			entryType: normalizeThreadType(t.entryType),
+			timestamp: t.createdAt.getTime(),
+			content: t.content,
+		}))
+		const columnExtras = `# Stage: ${column.name}\n\n${column.prompt}\n\n## Card: ${card.title}\n\n${card.body}${VERDICT_INSTRUCTION}`
+		// 100,000 chars (~25k tokens) — well within the 40% budget cap described in
+		// the session-efficiency design; game scripts are small enough this should
+		// never fire in practice.
+		const targetFiles = loadTargetFiles(card.targets ?? [], workDir, 100000)
+		const assembled = assembleContext({
+			projectRoot: this.projectRoot,
+			planFiles: targetFiles,
+			cardThread: thread,
+			columnExtras,
+			cardId: card.id,
+			tokenBudget: this.tokenBudget,
+		})
 
 		emitEvent(this.onEvent, { type: "running", cardId: card.id })
 
@@ -1095,6 +1218,20 @@ export class Worker {
 				// No changes to commit, or a transient git failure — the verdict still
 				// drives the card; a missing commit is not itself a card failure.
 			}
+		}
+
+		// Layer 3 — cross-session context: extract a short, deterministic session
+		// note (files touched, test results, HEAD commit, remaining-work tail) and
+		// save it to the card thread so the NEXT session does not have to
+		// rediscover what this one already learned (existing thread assembly in
+		// context.ts already includes `note` entries — no changes needed there).
+		// Best-effort: a note-extraction hiccup must never strand the card.
+		try {
+			const headCommit = getHeadCommitOneline(workDir)
+			const note = buildSessionNote({ stdout: result.stdout, replyText, headCommit })
+			this.dbStore.addCardThreadEntry({ cardId: card.id, entryType: "note", content: note })
+		} catch {
+			// Best-effort — see above.
 		}
 
 		switch (verdict.verdict) {

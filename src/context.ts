@@ -344,3 +344,93 @@ export function assembleContext(options: ContextAssemblerOptions): AssembledCont
 	const assembler = new ContextAssembler(options)
 	return assembler.assemble()
 }
+
+const TARGET_FILE_TOO_LARGE_PLACEHOLDER = "[File too large — read via tool call]"
+
+// Locate a target's test counterpart: `scripts/sim/grid_combat.gd` (or any nested
+// path) looks up `tests/test_grid_combat.gd`, and a `tests/test_foo.gd` file looks
+// up `scripts/foo.gd`. Directory prefixes are stripped entirely — only the
+// basename matters. Pure function; existence on disk is checked by the caller.
+// Note: reverse lookup (tests/ -> scripts/) produces a FLAT path (scripts/foo.gd),
+// not a nested one (scripts/sim/foo.gd). This is acceptable because targets
+// typically list source files (deliverables), making forward the primary path.
+function testCounterpartPath(targetPath: string): string {
+	const basename = path.basename(targetPath)
+	if (basename.startsWith("test_")) {
+		const originalName = basename.slice("test_".length)
+		return path.posix.join("scripts", originalName)
+	}
+	return path.posix.join("tests", `test_${basename}`)
+}
+
+// Truncate the largest slices first (replacing their content with a placeholder)
+// until the total content length fits within maxChars. Never drops a slice
+// entirely — the caller still learns the file exists and where to read it.
+function truncateTargetSlices(slices: PlanSlice[], maxChars: number): PlanSlice[] {
+	const totalChars = slices.reduce((sum, slice) => sum + slice.content.length, 0)
+	if (totalChars <= maxChars) {
+		return slices
+	}
+
+	const result = slices.map((slice) => ({ ...slice }))
+	const byDescendingSize = result
+		.map((slice, index) => ({ index, length: slice.content.length }))
+		.sort((a, b) => b.length - a.length)
+
+	let remaining = totalChars
+	for (const { index } of byDescendingSize) {
+		if (remaining <= maxChars) {
+			break
+		}
+		const slice = result[index]
+		if (slice === undefined) {
+			continue
+		}
+		remaining -= slice.content.length
+		slice.content = TARGET_FILE_TOO_LARGE_PLACEHOLDER
+		remaining += slice.content.length
+	}
+
+	return result
+}
+
+// Layer 1 — target file pre-loading. Reads every path in the card's `targets`
+// array (plus each one's test counterpart, when present on disk) from workDir
+// and returns them as PlanSlice-shaped objects that merge into the existing
+// plan-slices tier, so assembleContext's token-budget truncation applies to them
+// unchanged. Missing files (new cards, doc-only counterparts) are silently
+// skipped — this is not an error, just nothing to pre-load yet.
+export function loadTargetFiles(targets: string[], workDir: string, maxChars: number): PlanSlice[] {
+	const seen = new Set<string>()
+	const candidatePaths: string[] = []
+
+	for (const target of targets) {
+		if (!seen.has(target)) {
+			seen.add(target)
+			candidatePaths.push(target)
+		}
+		const counterpart = testCounterpartPath(target)
+		if (!seen.has(counterpart)) {
+			seen.add(counterpart)
+			candidatePaths.push(counterpart)
+		}
+	}
+
+	const slices: PlanSlice[] = []
+	for (const relativePath of candidatePaths) {
+		let content: string
+		try {
+			content = fs.readFileSync(path.join(workDir, relativePath), "utf8")
+		} catch {
+			continue
+		}
+		slices.push({
+			id: relativePath,
+			title: relativePath,
+			content,
+			relevantCardIds: [],
+		})
+	}
+
+	return truncateTargetSlices(slices, maxChars)
+}
