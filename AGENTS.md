@@ -122,6 +122,19 @@ before "improving" the classifiers again):**
   transcript and commits WIP before releasing the card. Any new infra pattern must be either
   a multi-word phrase or confined to errorMessage context — never a bare number or short token.
 
+## pi invocation — no `--thinking` flag (2026-09-09)
+
+The `--thinking` flag (which sets a per-turn reasoning budget) is deliberately NOT passed.
+`medium` (2048 tok/turn) caused analysis-paralysis spirals: the model spent 75 minutes
+generating 6,912 thinking tokens across 15 turns with zero file writes on M2-03b
+Test-Writing. `low` still filled its budget. Removing the flag entirely forces the model to
+reason inline with its tool calls — plan the step, act, observe — instead of spiraling in a
+private reasoning channel.
+
+If a future model genuinely benefits from explicit reasoning (better quality on complex
+planning), re-evaluate — but measure the TIME-TO-FIRST-TOOL-CALL and the ratio of thinking
+tokens to action tokens across real sessions before re-enabling. The default is: no thinking.
+
 ## Authoring cards — targets and dependencies
 
 ### Declare `targets` explicitly for cards that produce code
