@@ -1773,7 +1773,7 @@ describe("invokePi — spawn seam", () => {
 		expect(captured[i + 1]).toBe("json")
 	})
 
-	it("invokes pi with --thinking medium (bounds per-turn reasoning so sessions do not spiral)", async () => {
+	it("does NOT pass --thinking (removed: medium/low both caused analysis-paralysis spirals)", async () => {
 		const { spawn: inner } = makeFakeSpawn({
 			chunks: [{ at: 5, stream: "out", text: '{"type":"agent_end","messages":[]}' }],
 			exitAfterMs: 20,
@@ -1785,9 +1785,7 @@ describe("invokePi — spawn seam", () => {
 			return inner(args, opts)
 		}
 		await invokePi({ prompt: "p", cwd: "/tmp" }, spy)
-		const i = captured.indexOf("--thinking")
-		expect(i).toBeGreaterThanOrEqual(0)
-		expect(captured[i + 1]).toBe("medium")
+		expect(captured.indexOf("--thinking")).toBe(-1)
 	})
 })
 

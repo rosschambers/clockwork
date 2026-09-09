@@ -525,7 +525,11 @@ export async function invokePi(
 	// (a single stage ground 75 min / 71k tokens). "medium" keeps each turn
 	// decisive — plan the step, act — which is enough quality for well-scoped cards
 	// with a written plan + checkable DoD, and keeps stages to minutes not tens.
-	args.push("--thinking", "medium")
+	// No --thinking flag: let the model act without a reasoning budget.
+	// "medium" caused analysis-paralysis spirals (6,912 thinking tokens,
+	// zero file writes in 75 min — project-bastion M2-03b, 2026-09-09).
+	// "low" still filled its budget per turn. Removing it entirely forces
+	// the model to reason inline with its actions instead of spiraling.
 	args.push("--provider", invocation.provider ?? DEFAULT_PI_PROVIDER)
 	if (invocation.model) {
 		args.push("--model", invocation.model)
