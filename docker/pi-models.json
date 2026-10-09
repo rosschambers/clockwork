@@ -1,7 +1,7 @@
 {
 	"providers": {
 		"frame-dense-low": {
-			"baseUrl": "http://your-model-host:8185/v1",
+			"baseUrl": "http://your-model-host:8085/v1",
 			"api": "openai-completions",
 			"apiKey": "frame",
 			"compat": { "supportsDeveloperRole": false, "thinkingFormat": "qwen-chat-template" },

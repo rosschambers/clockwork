@@ -285,8 +285,9 @@ export interface PiResult {
 export interface PiInvocation {
 	prompt: string
 	cwd: string
-	// pi provider carrying the endpoint. Defaults to the arbiter LOW port
-	// (frame-flash-low) so clockwork work is background/preemptible by design.
+	// pi provider carrying the endpoint. Defaults to frame's flash model
+	// (provider name "frame-flash-low" — legacy from the removed frame-arbiter
+	// low lane; it now points at :8085, where batch slots share capacity).
 	provider?: string
 	model?: string
 	skills?: string[]
@@ -322,9 +323,10 @@ export const DEFAULT_PI_MAX_RUNTIME_MS = 60 * 60 * 1000
 // verdict tail while making OOM impossible.
 export const PI_STREAM_CAPTURE_CAP_BYTES = 8 * 1024 * 1024
 
-// clockwork is background work by definition, so it targets the frame-arbiter
-// LOW port (a Hugo request preempts it). This is the provider the container's
-// pi config must define -> http://frame:8185/v1 (flash 180B, Qwen3.8-Flash-Next).
+// The provider name is legacy from the frame-arbiter LOW lane (removed
+// 2026-10-09 — Flash now shares batch slots, no preemption). This is the
+// provider the container's pi config must define -> http://frame:8085/v1
+// (flash 180B, Qwen3.8-Flash-Next).
 export const DEFAULT_PI_PROVIDER = "frame-flash-low"
 
 // The closeout session gets its OWN short watchdog, independent of the work
